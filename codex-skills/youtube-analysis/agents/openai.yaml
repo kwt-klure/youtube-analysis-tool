@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube Analysis"
+  short_description: "Analyze YouTube videos into transcripts and keyframes"
+  default_prompt: "Use $youtube-analysis to turn a YouTube URL into a transcript and keyframes."

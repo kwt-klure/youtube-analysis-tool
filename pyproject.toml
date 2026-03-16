@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youtube-analysis-tool"
+version = "0.1.0"
+description = "Hybrid local-first YouTube analysis tooling for transcripts and keyframes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+youtube = [
+  "openai",
+  "opencv-python",
+  "pytesseract",
+  "yt-dlp",
+]
+
+[project.scripts]
+youtube-analyze = "youtube_analysis_tool.pipeline:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
