@@ -7,6 +7,9 @@ from . import constants
 from .artifacts import write_json
 
 
+TRANSCRIPT_PREVIEW_LIMIT = 1000
+
+
 def render_markdown_report(report: dict[str, Any]) -> str:
     lines = [
         f"# {report.get('title', '影片分析報告')}",
@@ -119,26 +122,45 @@ def normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
+def preview_text(text: str, *, limit: int = TRANSCRIPT_PREVIEW_LIMIT) -> str:
+    return str(text or "")[:limit].strip()
+
+
+def normalize_transcript(root: Path, transcript_path: Path, transcript: dict[str, Any] | None) -> dict[str, Any]:
     transcript = transcript or {}
     return {
         "source": transcript.get("source"),
         "language": transcript.get("language"),
         "source_path": transcript.get("source_path"),
         "segment_count": transcript.get("segment_count", 0),
-        "text": transcript.get("text", ""),
-        "segments": transcript.get("segments", []),
+        "preview_text": preview_text(transcript.get("text", "")),
+        "full_transcript_artifact": artifact_reference(root, transcript_path),
+    }
+
+
+def slim_transcript_window(window: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start_seconds": window.get("start_seconds"),
+        "end_seconds": window.get("end_seconds"),
+        "text": window.get("text", ""),
     }
 
 
 def merge_segment_payloads(
     segments: list[dict[str, Any]],
     manifest_entries: list[dict[str, Any]],
+    visuals_payload: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     manifest_by_id = {entry["segment_id"]: entry for entry in manifest_entries}
+    visual_entries_by_segment = {
+        entry["segment_id"]: entry
+        for bucket in ("slides", "charts")
+        for entry in visuals_payload.get(bucket, [])
+    }
     merged: list[dict[str, Any]] = []
     for segment in segments:
         entry = manifest_by_id.get(segment["segment_id"], {})
+        visual_entry = visual_entries_by_segment.get(segment["segment_id"], {})
         merged.append(
             {
                 "segment_id": segment["segment_id"],
@@ -155,7 +177,7 @@ def merge_segment_payloads(
                 "ocr_char_count": segment.get("ocr_char_count", 0),
                 "numeric_token_ratio": segment.get("numeric_token_ratio", 0.0),
                 "chart_hint_score": segment.get("chart_hint_score", 0.0),
-                "transcript_window": segment.get("transcript_window", {}),
+                "transcript_window": slim_transcript_window(segment.get("transcript_window", {})),
                 "review_required": entry.get("review_required", segment.get("review_required", False)),
                 "review_status": entry.get("review_status", segment.get("review_status")),
                 "routing_disposition": entry.get("routing_disposition", segment.get("routing_disposition")),
@@ -163,6 +185,9 @@ def merge_segment_payloads(
                 "detail": entry.get("detail"),
                 "prompt_family": entry.get("prompt_family"),
                 "review_note": entry.get("review_note", ""),
+                "durable_image_paths": visual_entry.get("image_paths", []),
+                "durable_primary_image_path": visual_entry.get("primary_image_path"),
+                "durable_frame_count": visual_entry.get("frame_count", 0),
             }
         )
     return merged
@@ -182,10 +207,15 @@ def summarize_routing(manifest_entries: list[dict[str, Any]]) -> dict[str, Any]:
 def collect_artifact_references(paths: Any) -> dict[str, Any]:
     root = paths.root
     return {
+        "analysis_json": artifact_reference(root, paths.analysis_json_path),
         "metadata_json": artifact_reference(root, paths.metadata_path),
         "source_txt": artifact_reference(root, paths.source_path),
         "transcript_json": artifact_reference(root, paths.transcript_json_path),
         "transcript_txt": artifact_reference(root, paths.transcript_text_path),
+        "visuals_manifest_json": artifact_reference(root, paths.visuals_manifest_path),
+        "visuals_dir": artifact_reference(root, paths.visuals_dir),
+        "visuals_slides_dir": artifact_reference(root, paths.visuals_slides_dir),
+        "visuals_charts_dir": artifact_reference(root, paths.visuals_charts_dir),
         "triage_frames_jsonl": artifact_reference(root, paths.triage_frames_path),
         "triage_segments_json": artifact_reference(root, paths.triage_segments_path),
         "review_queue_json": artifact_reference(root, paths.review_queue_path),
@@ -216,6 +246,7 @@ def build_analysis_payload(
     ocr: dict[str, Any],
     segments: list[dict[str, Any]],
     manifest_entries: list[dict[str, Any]],
+    visuals_payload: dict[str, list[dict[str, Any]]],
     errors: list[dict[str, Any]],
     cleanup_intermediates: bool,
     transcript_mode: str,
@@ -247,9 +278,10 @@ def build_analysis_payload(
             scene_threshold=scene_threshold,
         ),
         "metadata": normalize_metadata(metadata),
-        "transcript": normalize_transcript(transcript),
+        "transcript": normalize_transcript(root, paths.transcript_json_path, transcript),
         "ocr": ocr,
-        "segments": merge_segment_payloads(segments, manifest_entries),
+        "visuals": visuals_payload,
+        "segments": merge_segment_payloads(segments, manifest_entries, visuals_payload),
         "routing": summarize_routing(manifest_entries),
         "artifacts": collect_artifact_references(paths),
         "errors": errors,
@@ -270,6 +302,7 @@ def write_analysis_file(
     ocr: dict[str, Any],
     segments: list[dict[str, Any]],
     manifest_entries: list[dict[str, Any]],
+    visuals_payload: dict[str, list[dict[str, Any]]],
     errors: list[dict[str, Any]],
     cleanup_intermediates: bool,
     transcript_mode: str,
@@ -292,6 +325,7 @@ def write_analysis_file(
         ocr=ocr,
         segments=segments,
         manifest_entries=manifest_entries,
+        visuals_payload=visuals_payload,
         errors=errors,
         cleanup_intermediates=cleanup_intermediates,
         transcript_mode=transcript_mode,

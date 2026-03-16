@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.request import urlopen
 from urllib.parse import urlparse
 
-from . import constants, gpt, reporting, review, routing, triage
+from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
 
 
@@ -23,6 +23,10 @@ from .artifacts import write_json
 class AnalysisPaths:
     root: Path
     analysis_json_path: Path
+    visuals_dir: Path
+    visuals_manifest_path: Path
+    visuals_slides_dir: Path
+    visuals_charts_dir: Path
     audio_dir: Path
     video_dir: Path
     subtitles_dir: Path
@@ -86,6 +90,10 @@ def analysis_paths(root: Path) -> AnalysisPaths:
     return AnalysisPaths(
         root=root,
         analysis_json_path=root / "analysis.json",
+        visuals_dir=root / "visuals",
+        visuals_manifest_path=root / "visuals" / "manifest.json",
+        visuals_slides_dir=root / "visuals" / "slides",
+        visuals_charts_dir=root / "visuals" / "charts",
         audio_dir=root / "audio",
         video_dir=root / "video",
         subtitles_dir=root / "subtitles",
@@ -121,6 +129,7 @@ def ensure_dirs(paths: AnalysisPaths, with_ocr: bool = False) -> None:
         paths.video_dir,
         paths.subtitles_dir,
         paths.keyframes_dir,
+        paths.visuals_dir,
         paths.triage_dir,
         paths.review_dir,
         paths.routing_dir,
@@ -133,6 +142,8 @@ def ensure_dirs(paths: AnalysisPaths, with_ocr: bool = False) -> None:
 
 
 def clear_stale_output_files(paths: AnalysisPaths) -> None:
+    shutil.rmtree(paths.visuals_dir, ignore_errors=True)
+    paths.visuals_dir.mkdir(parents=True, exist_ok=True)
     for path in (
         paths.error_path,
         paths.gpt_analyses_path,
@@ -857,8 +868,10 @@ def analyze_source(
     metadata: dict[str, Any] = {}
     transcript: dict[str, Any] | None = None
     ocr_state = default_ocr_state(ocr_mode)
+    frames: list[dict[str, Any]] = []
     segments: list[dict[str, Any]] = []
     manifest_entries: list[dict[str, Any]] = []
+    visuals_payload = visuals.empty_visuals_payload()
     gpt_payload: dict[str, Any] | None = None
     errors: list[dict[str, Any]] = []
 
@@ -909,7 +922,7 @@ def analyze_source(
             raise
 
         if triage_mode == "on" and keyframe_rows:
-            _, segments = triage.run_local_triage(paths.root, keyframe_rows, ocr_rows, transcript)
+            frames, segments = triage.run_local_triage(paths.root, keyframe_rows, ocr_rows, transcript)
             manifest_entries = [
                 routing.manifest_entry_from_segment(segment, gpt_model)
                 for segment in segments
@@ -934,6 +947,13 @@ def analyze_source(
             write_json(paths.routing_manifest_path, {"segments": manifest_entries})
         else:
             write_empty_stage_artifacts(paths)
+
+        visuals_payload = visuals.save_durable_visuals(
+            paths.root,
+            frames=frames,
+            segments=segments,
+            manifest_entries=manifest_entries,
+        )
 
         if gpt_mode == "on":
             approved_entries = [entry for entry in manifest_entries if entry.get("approved_for_gpt")]
@@ -973,6 +993,7 @@ def analyze_source(
             ocr=ocr_state,
             segments=segments,
             manifest_entries=manifest_entries,
+            visuals_payload=visuals_payload,
             errors=errors,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,

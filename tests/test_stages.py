@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from youtube_analysis_tool import constants, gpt, pipeline, reporting, review, routing, triage
+from youtube_analysis_tool import constants, gpt, pipeline, reporting, review, routing, triage, visuals
 from youtube_analysis_tool.artifacts import write_json
 
 
@@ -273,6 +273,7 @@ class AnalysisBundleTests(unittest.TestCase):
             root = Path(tmpdir)
             paths = pipeline.analysis_paths(root)
             for path in (
+                paths.visuals_dir,
                 paths.triage_dir,
                 paths.review_dir,
                 paths.routing_dir,
@@ -280,6 +281,7 @@ class AnalysisBundleTests(unittest.TestCase):
                 paths.report_dir,
             ):
                 path.mkdir(parents=True, exist_ok=True)
+            write_json(paths.visuals_manifest_path, {"slides": [], "charts": []})
             write_json(paths.metadata_path, {"id": "demo", "title": "Demo"})
             write_json(paths.transcript_json_path, {"source": "subtitle"})
             paths.transcript_text_path.write_text("demo\n", encoding="utf-8")
@@ -322,6 +324,7 @@ class AnalysisBundleTests(unittest.TestCase):
                     "review_note": "",
                 }
             ]
+            long_text = "Revenue is up. " * 200
 
             payload = reporting.write_analysis_file(
                 paths,
@@ -329,10 +332,24 @@ class AnalysisBundleTests(unittest.TestCase):
                 is_url=False,
                 is_youtube_url=False,
                 metadata={"id": "demo", "title": "Demo"},
-                transcript={"source": "subtitle", "text": "Revenue is up.", "segments": []},
+                transcript={"source": "subtitle", "text": long_text, "segments": []},
                 ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "artifact_path": "ocr/index.csv", "error": None},
                 segments=segments,
                 manifest_entries=manifest,
+                visuals_payload={
+                    "slides": [
+                        {
+                            "segment_id": "segment-0001",
+                            "effective_label": "slides",
+                            "image_paths": ["visuals/slides/segment-0001/slide.jpg"],
+                            "primary_image_path": "visuals/slides/segment-0001/slide.jpg",
+                            "frame_count": 1,
+                            "transcript_excerpt": "Revenue is up.",
+                            "source_segment_ref": {"segment_id": "segment-0001"},
+                        }
+                    ],
+                    "charts": [],
+                },
                 errors=[],
                 cleanup_intermediates=True,
                 transcript_mode="auto",
@@ -350,6 +367,14 @@ class AnalysisBundleTests(unittest.TestCase):
         self.assertEqual(payload["analysis_version"], written["analysis_version"])
         self.assertEqual("Revenue trend", written["segments"][0]["ocr_summary"])
         self.assertIn("routing_manifest_json", written["artifacts"])
+        self.assertEqual("visuals/slides/segment-0001/slide.jpg", written["segments"][0]["durable_primary_image_path"])
+        self.assertEqual("subtitle", written["transcript"]["source"])
+        self.assertLessEqual(len(written["transcript"]["preview_text"]), 1000)
+        self.assertTrue(written["transcript"]["preview_text"].startswith("Revenue is up."))
+        self.assertNotIn("text", written["transcript"])
+        self.assertNotIn("segments", written["transcript"])
+        self.assertEqual({"start_seconds": None, "end_seconds": None, "text": "Revenue is up."}, written["segments"][0]["transcript_window"])
+        self.assertEqual(1, len(written["visuals"]["slides"]))
         self.assertNotIn("gpt", written)
         self.assertFalse(written["artifacts"]["report_json"]["exists"])
 
@@ -358,6 +383,7 @@ class AnalysisBundleTests(unittest.TestCase):
             root = Path(tmpdir)
             paths = pipeline.analysis_paths(root)
             for path in (
+                paths.visuals_dir,
                 paths.triage_dir,
                 paths.review_dir,
                 paths.routing_dir,
@@ -365,6 +391,7 @@ class AnalysisBundleTests(unittest.TestCase):
                 paths.report_dir,
             ):
                 path.mkdir(parents=True, exist_ok=True)
+            write_json(paths.visuals_manifest_path, {"slides": [], "charts": []})
 
             payload = reporting.write_analysis_file(
                 paths,
@@ -376,6 +403,7 @@ class AnalysisBundleTests(unittest.TestCase):
                 ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "artifact_path": "ocr/index.csv", "error": None},
                 segments=[],
                 manifest_entries=[],
+                visuals_payload={"slides": [], "charts": []},
                 errors=[],
                 cleanup_intermediates=True,
                 transcript_mode="auto",
@@ -396,6 +424,101 @@ class AnalysisBundleTests(unittest.TestCase):
 
         self.assertEqual("gpt-5.4", payload["gpt"]["model"])
         self.assertEqual("影片分析報告", payload["gpt"]["final_report"]["title"])
+
+
+class DurableVisualTests(unittest.TestCase):
+    def test_save_durable_visuals_exports_only_slides_and_charts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "keyframes").mkdir(parents=True, exist_ok=True)
+            for filename in ("slide.jpg", "chart.jpg", "uncertain.jpg"):
+                (root / "keyframes" / filename).write_bytes(filename.encode("utf-8"))
+
+            frames = [
+                {
+                    "frame_id": "frame-1",
+                    "frame_path": "keyframes/slide.jpg",
+                    "timestamp_seconds": 0.0,
+                    "blur_score": 200.0,
+                },
+                {
+                    "frame_id": "frame-2",
+                    "frame_path": "keyframes/chart.jpg",
+                    "timestamp_seconds": 1.0,
+                    "blur_score": 250.0,
+                },
+                {
+                    "frame_id": "frame-3",
+                    "frame_path": "keyframes/uncertain.jpg",
+                    "timestamp_seconds": 2.0,
+                    "blur_score": 150.0,
+                },
+            ]
+            segments = [
+                {
+                    "segment_id": "segment-0001",
+                    "heuristic_label": "slides",
+                    "frame_ids": ["frame-1"],
+                    "representative_frame_paths": ["keyframes/slide.jpg"],
+                    "start_seconds": 0.0,
+                    "end_seconds": 0.0,
+                    "start_hms": "00:00:00",
+                    "end_hms": "00:00:00",
+                    "ocr_summary": "Slide",
+                    "ocr_char_count": 5,
+                    "transcript_window": {"text": "Slide excerpt"},
+                },
+                {
+                    "segment_id": "segment-0002",
+                    "heuristic_label": "chart_table",
+                    "frame_ids": ["frame-2"],
+                    "representative_frame_paths": ["keyframes/chart.jpg"],
+                    "start_seconds": 1.0,
+                    "end_seconds": 1.0,
+                    "start_hms": "00:00:01",
+                    "end_hms": "00:00:01",
+                    "ocr_summary": "Chart",
+                    "ocr_char_count": 5,
+                    "transcript_window": {"text": "Chart excerpt"},
+                },
+                {
+                    "segment_id": "segment-0003",
+                    "heuristic_label": "uncertain",
+                    "frame_ids": ["frame-3"],
+                    "representative_frame_paths": ["keyframes/uncertain.jpg"],
+                    "start_seconds": 2.0,
+                    "end_seconds": 2.0,
+                    "start_hms": "00:00:02",
+                    "end_hms": "00:00:02",
+                    "ocr_summary": "Uncertain",
+                    "ocr_char_count": 9,
+                    "transcript_window": {"text": "Uncertain excerpt"},
+                },
+            ]
+            manifest_entries = [
+                {"segment_id": "segment-0001", "effective_label": "slides"},
+                {"segment_id": "segment-0002", "effective_label": "chart_table"},
+                {"segment_id": "segment-0003", "effective_label": "uncertain"},
+            ]
+
+            payload = visuals.save_durable_visuals(
+                root,
+                frames=frames,
+                segments=segments,
+                manifest_entries=manifest_entries,
+            )
+
+            manifest = json.loads((root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
+            slide_exists = (root / "visuals" / "slides" / "segment-0001" / "slide.jpg").exists()
+            chart_exists = (root / "visuals" / "charts" / "segment-0002" / "chart.jpg").exists()
+            uncertain_exists = (root / "visuals" / "slides" / "segment-0003").exists()
+
+        self.assertEqual(1, len(payload["slides"]))
+        self.assertEqual(1, len(payload["charts"]))
+        self.assertEqual(payload, manifest)
+        self.assertTrue(slide_exists)
+        self.assertTrue(chart_exists)
+        self.assertFalse(uncertain_exists)
 
 
 if __name__ == "__main__":

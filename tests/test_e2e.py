@@ -177,7 +177,37 @@ class EndToEndPipelineTests(unittest.TestCase):
         analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
         self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["segments"][0]["ocr_summary"])
         self.assertNotIn("gpt", analysis)
+        self.assertEqual("subtitle", analysis["transcript"]["source"])
+        self.assertNotIn("text", analysis["transcript"])
+        self.assertNotIn("segments", analysis["transcript"])
+        self.assertEqual(1, len(analysis["visuals"]["slides"]))
+        self.assertEqual(1, len(analysis["visuals"]["slides"][0]["image_paths"]))
+        for path in analysis["visuals"]["slides"][0]["image_paths"]:
+            self.assertTrue((output_root / path).exists())
         self.assertEqual(0, self.gpt_call_count)
+
+    def test_chart_heavy_input_saves_durable_chart_visuals(self) -> None:
+        source_path, out_dir = self.make_stubbed_run(
+            keyframes=[
+                {"kind": "scene", "filename": "chart-1.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00"},
+                {"kind": "scene", "filename": "chart-2.jpg", "timestamp_seconds": 4.0, "timestamp_hms": "00:00:04"},
+            ],
+            ocr_rows=[
+                {"filename": "chart-1.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00", "text": "Q1 revenue 42% growth table chart"},
+                {"filename": "chart-2.jpg", "timestamp_seconds": 4.0, "timestamp_hms": "00:00:04", "text": "Q2 revenue 57% growth table chart"},
+            ],
+            phash_by_filename={"chart-1.jpg": "0f0f0f0f0f0f0f0f", "chart-2.jpg": "f0f0f0f0f0f0f0f0"},
+        )
+
+        output_root = pipeline.analyze_source(str(source_path), out_dir=out_dir, gpt_mode="off")
+
+        analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
+        manifest = json.loads((output_root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, len(analysis["visuals"]["charts"]))
+        self.assertEqual(2, len(analysis["visuals"]["charts"][0]["image_paths"]))
+        self.assertEqual(manifest, analysis["visuals"])
+        for path in analysis["visuals"]["charts"][0]["image_paths"]:
+            self.assertTrue((output_root / path).exists())
 
     def test_talking_head_input_yields_no_gpt_candidates(self) -> None:
         source_path, out_dir = self.make_stubbed_run(
@@ -205,6 +235,8 @@ class EndToEndPipelineTests(unittest.TestCase):
         analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
         self.assertIn("gpt", analysis)
         self.assertEqual("影片分析報告", analysis["gpt"]["final_report"]["title"])
+        self.assertEqual([], analysis["visuals"]["slides"])
+        self.assertEqual([], analysis["visuals"]["charts"])
 
     def test_uncertain_content_stops_before_gpt_until_reviewed(self) -> None:
         source_path, out_dir = self.make_stubbed_run(
@@ -257,11 +289,15 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertFalse((output_root / "ocr").exists())
         self.assertTrue((output_root / "triage" / "segments.json").exists())
         self.assertTrue((output_root / "routing" / "manifest.json").exists())
+        self.assertTrue((output_root / "visuals" / "manifest.json").exists())
         analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
         self.assertEqual("auto", analysis["ocr"]["mode"])
         self.assertEqual("completed", analysis["ocr"]["status"])
         self.assertFalse(analysis["artifacts"]["intermediates"]["keyframes_dir"]["exists"])
         self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["segments"][0]["ocr_summary"])
+        self.assertTrue((output_root / analysis["visuals"]["slides"][0]["primary_image_path"]).exists())
+        manifest = json.loads((output_root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest, analysis["visuals"])
 
     def test_failed_run_also_cleans_intermediate_dirs(self) -> None:
         tempdir = tempfile.TemporaryDirectory()
