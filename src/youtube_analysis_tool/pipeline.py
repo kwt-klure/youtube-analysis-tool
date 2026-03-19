@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -66,8 +67,19 @@ def is_youtube_url(source: str) -> bool:
 
 
 def slugify(value: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
-    return normalized or "video"
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    chunks: list[str] = []
+    separator_open = False
+    for character in normalized:
+        if character.isalnum():
+            chunks.append(character.casefold())
+            separator_open = False
+            continue
+        if chunks and not separator_open:
+            chunks.append("-")
+            separator_open = True
+    slug = "".join(chunks).strip("-")
+    return slug or "video"
 
 
 def hms_from_seconds(seconds: float) -> str:
@@ -84,7 +96,8 @@ def default_output_dir_for_source(
 ) -> Path:
     if video_id:
         video_id_slug = slugify(video_id)
-        title_slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(video_title or "")).strip("-").lower()
+        raw_title = str(video_title or "").strip()
+        title_slug = slugify(raw_title) if raw_title else ""
         if title_slug:
             return constants.DEFAULT_OUTPUT_ROOT / f"{title_slug}-{video_id_slug}"
         return constants.DEFAULT_OUTPUT_ROOT / video_id_slug

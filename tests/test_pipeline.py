@@ -81,6 +81,17 @@ class OutputPathTests(unittest.TestCase):
         output = default_output_dir_for_source("https://youtu.be/abc123", "AbC_123", "My Great Talk")
         self.assertEqual(Path("output/youtube/my-great-talk-abc-123"), output)
 
+    def test_url_with_unicode_title_and_id_uses_title_id(self) -> None:
+        output = default_output_dir_for_source(
+            "https://youtu.be/8LrniR6db-k",
+            "8LrniR6db-k",
+            "『荒野のコトブキ飛行隊』イジツ見聞録～戦闘機編～",
+        )
+        self.assertEqual(
+            Path("output/youtube/荒野のコトブキ飛行隊-イジツ見聞録-戦闘機編-8lrnir6db-k"),
+            output,
+        )
+
     def test_url_without_title_falls_back_to_id(self) -> None:
         output = default_output_dir_for_source("https://youtu.be/abc123", "AbC_123", None)
         self.assertEqual(Path("output/youtube/abc-123"), output)
