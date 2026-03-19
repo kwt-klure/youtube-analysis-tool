@@ -7,6 +7,41 @@ escalate to GPT only when that extra semantic layer is actually worth paying
 for. A normal run is designed for downstream AI consumption, not for browsing a
 pile of side artifacts by hand.
 
+## Status
+
+The current v1 core path is validated and intentionally stable.
+
+- long YouTube runs complete on local hardware
+- the default `minimal` single-file contract is holding up
+- output size remains practical even on long inputs
+- downstream AI can read and reason over the resulting bundle
+
+Unless a real failure signal shows up, the project should prefer stability over
+gratuitous rewrites.
+
+## Validated Cases
+
+The current implementation has already been exercised against:
+
+- short and mid-length YouTube videos with existing subtitles
+- YouTube videos without usable captions, using local Whisper fallback
+- long-form inputs where a single `output.json` still remained manageable
+- local-only runs with `--gpt off`
+
+This does not mean every transcript is clean. It means the core path is
+producing usable AI-ready bundles across the kinds of runs it was designed for.
+
+## Known Limits
+
+Current limitations are mostly about source quality, not the output contract.
+
+- no-caption videos depend on local Whisper, so transcript quality can drift
+- Japanese proper nouns, niche terminology, and low-frequency names can be wrong
+- `visuals` currently promote `slides` and `charts` only; other valuable visual
+  material may stay unpromoted
+- the tool is better at preserving high-level structure than exact scene-by-scene
+  reconstruction when the transcript is noisy
+
 ## What The Default Run Gives You
 
 Running `youtube-analyze --source ...` with no extra flags:
