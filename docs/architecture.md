@@ -96,21 +96,22 @@ GPT should not be used for:
 
 ## Artifacts
 
-The pipeline persists traceable stage outputs:
+The default contract is a single AI-friendly bundle:
 
-- `analysis.json`
-- `triage/frames.jsonl`
-- `triage/segments.json`
-- `review/queue.json`
-- `review/decisions.json`
-- `routing/manifest.json`
-- `gpt/analyses.json`
-- `report/report.md`
-- `report/report.json`
+- `output.json`
 
-`analysis.json` is the canonical long-term artifact for each video. It survives
-cleanup and bundles normalized source metadata, transcript data, OCR status,
-segment summaries, routing state, artifact references, and optional GPT output.
+`output.json` is the canonical long-term artifact for each video. It embeds:
+
+- normalized source metadata
+- the full transcript plus timestamped transcript segments
+- grouped `slides` / `charts` visual galleries with one inline primary Base64 image per item in minimal mode
+- compact processing metadata
+- errors
+- optional GPT output
+
+Traceable stage outputs such as `triage/`, `review/`, `routing/`, `visuals/`,
+`gpt/`, `report/`, `metadata.json`, and `transcript.json` still exist, but only
+when debug artifacts are explicitly enabled.
 
 ## Apple Silicon fit
 

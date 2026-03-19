@@ -15,7 +15,6 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from youtube_analysis_tool import constants, gpt, pipeline, reporting, review, routing, triage, visuals
-from youtube_analysis_tool.artifacts import write_json
 
 
 class TriageHelperTests(unittest.TestCase):
@@ -267,85 +266,50 @@ class GptAndReportTests(unittest.TestCase):
             self.assertEqual("segment-0001", artifact["segment_analyses"][0]["source_segment_id"])
 
 
-class AnalysisBundleTests(unittest.TestCase):
-    def test_analysis_json_is_written_without_gpt_report(self) -> None:
+class OutputBundleTests(unittest.TestCase):
+    def test_output_json_embeds_full_transcript_and_visual_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             paths = pipeline.analysis_paths(root)
-            for path in (
-                paths.visuals_dir,
-                paths.triage_dir,
-                paths.review_dir,
-                paths.routing_dir,
-                paths.gpt_dir,
-                paths.report_dir,
-            ):
-                path.mkdir(parents=True, exist_ok=True)
-            write_json(paths.visuals_manifest_path, {"slides": [], "charts": []})
-            write_json(paths.metadata_path, {"id": "demo", "title": "Demo"})
-            write_json(paths.transcript_json_path, {"source": "subtitle"})
-            paths.transcript_text_path.write_text("demo\n", encoding="utf-8")
-            write_json(paths.triage_segments_path, {"segments": []})
-            write_json(paths.review_queue_path, {"queue": []})
-            write_json(paths.review_decisions_path, {"decisions": {}})
-            write_json(paths.routing_manifest_path, {"segments": []})
-            paths.triage_frames_path.write_text("", encoding="utf-8")
-            segments = [
-                {
-                    "segment_id": "segment-0001",
-                    "heuristic_label": "slides",
-                    "heuristic_confidence": 0.9,
-                    "start_seconds": 0.0,
-                    "end_seconds": 5.0,
-                    "start_hms": "00:00:00",
-                    "end_hms": "00:00:05",
-                    "frame_ids": ["frame-00001"],
-                    "representative_frame_paths": ["keyframes/slide.jpg"],
-                    "ocr_summary": "Revenue trend",
-                    "ocr_char_count": 80,
-                    "numeric_token_ratio": 0.2,
-                    "chart_hint_score": 0.0,
-                    "transcript_window": {"text": "Revenue is up."},
-                    "review_required": False,
-                    "review_status": "auto_approved",
-                    "routing_disposition": "candidate",
-                }
-            ]
-            manifest = [
-                {
-                    "segment_id": "segment-0001",
-                    "effective_label": "slides",
-                    "review_required": False,
-                    "review_status": "auto_approved",
-                    "routing_disposition": "candidate",
-                    "approved_for_gpt": False,
-                    "detail": "low",
-                    "prompt_family": "slides",
-                    "review_note": "",
-                }
-            ]
-            long_text = "Revenue is up. " * 200
+            (root / "keyframes").mkdir(parents=True, exist_ok=True)
+            (root / "keyframes" / "slide.jpg").write_bytes(b"slide-bytes")
 
-            payload = reporting.write_analysis_file(
+            payload = reporting.write_output_file(
                 paths,
                 source_input="/tmp/demo.mp4",
                 is_url=False,
                 is_youtube_url=False,
-                metadata={"id": "demo", "title": "Demo"},
-                transcript={"source": "subtitle", "text": long_text, "segments": []},
-                ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "artifact_path": "ocr/index.csv", "error": None},
-                segments=segments,
-                manifest_entries=manifest,
+                metadata={"id": "demo", "title": "Demo", "webpage_url": "https://youtu.be/demo", "chapters": [{"title": "Intro"}]},
+                transcript={
+                    "source": "subtitle",
+                    "language": "zh-tw",
+                    "text": "Revenue is up.",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "Revenue is up."}],
+                },
+                ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
                 visuals_payload={
                     "slides": [
                         {
                             "segment_id": "segment-0001",
-                            "effective_label": "slides",
-                            "image_paths": ["visuals/slides/segment-0001/slide.jpg"],
-                            "primary_image_path": "visuals/slides/segment-0001/slide.jpg",
-                            "frame_count": 1,
+                            "effective_label": "slide",
+                            "heuristic_confidence": 0.91,
+                            "start_seconds": 0.0,
+                            "end_seconds": 5.0,
+                            "start_hms": "00:00:00",
+                            "end_hms": "00:00:05",
+                            "ocr_text": "Revenue trend",
+                            "ocr_summary": "Revenue trend",
+                            "ocr_char_count": 80,
                             "transcript_excerpt": "Revenue is up.",
-                            "source_segment_ref": {"segment_id": "segment-0001"},
+                            "images": [
+                                {
+                                    "filename": "slide.jpg",
+                                    "mime_type": "image/jpeg",
+                                    "encoding": "base64",
+                                    "data": "c2xpZGUtYnl0ZXM=",
+                                }
+                            ],
+                            "primary_image_index": 0,
                         }
                     ],
                     "charts": [],
@@ -353,67 +317,48 @@ class AnalysisBundleTests(unittest.TestCase):
                 errors=[],
                 cleanup_intermediates=True,
                 transcript_mode="auto",
-                keyframe_mode="scene+interval",
                 ocr_mode="auto",
-                triage_mode="on",
                 gpt_mode="off",
-                review_mode="interactive",
-                interval_seconds=60,
-                scene_threshold=0.35,
+                artifacts_mode="minimal",
             )
 
-            written = json.loads(paths.analysis_json_path.read_text(encoding="utf-8"))
+            written = json.loads(paths.output_json_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["analysis_version"], written["analysis_version"])
-        self.assertEqual("Revenue trend", written["segments"][0]["ocr_summary"])
-        self.assertIn("routing_manifest_json", written["artifacts"])
-        self.assertEqual("visuals/slides/segment-0001/slide.jpg", written["segments"][0]["durable_primary_image_path"])
+        self.assertEqual(payload["output_version"], written["output_version"])
+        self.assertEqual("https://youtu.be/demo", written["metadata"]["url"])
+        self.assertEqual([{"title": "Intro"}], written["metadata"]["chapters"])
         self.assertEqual("subtitle", written["transcript"]["source"])
-        self.assertLessEqual(len(written["transcript"]["preview_text"]), 1000)
-        self.assertTrue(written["transcript"]["preview_text"].startswith("Revenue is up."))
-        self.assertNotIn("text", written["transcript"])
-        self.assertNotIn("segments", written["transcript"])
-        self.assertEqual({"start_seconds": None, "end_seconds": None, "text": "Revenue is up."}, written["segments"][0]["transcript_window"])
+        self.assertEqual("Revenue is up.", written["transcript"]["full_text"])
+        self.assertEqual(1, len(written["transcript"]["segments"]))
         self.assertEqual(1, len(written["visuals"]["slides"]))
+        self.assertEqual("base64", written["visuals"]["slides"][0]["images"][0]["encoding"])
+        self.assertEqual("slide", written["visuals"]["slides"][0]["effective_label"])
+        self.assertEqual("minimal", written["processing"]["artifact_mode"])
+        self.assertEqual("auto", written["processing"]["transcript_mode"])
+        self.assertEqual("auto", written["processing"]["ocr_mode"])
+        self.assertFalse(written["processing"]["gpt_enabled"])
         self.assertNotIn("gpt", written)
-        self.assertFalse(written["artifacts"]["report_json"]["exists"])
 
-    def test_analysis_json_can_embed_gpt_payload(self) -> None:
+    def test_output_json_can_embed_gpt_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             paths = pipeline.analysis_paths(root)
-            for path in (
-                paths.visuals_dir,
-                paths.triage_dir,
-                paths.review_dir,
-                paths.routing_dir,
-                paths.gpt_dir,
-                paths.report_dir,
-            ):
-                path.mkdir(parents=True, exist_ok=True)
-            write_json(paths.visuals_manifest_path, {"slides": [], "charts": []})
 
-            payload = reporting.write_analysis_file(
+            payload = reporting.write_output_file(
                 paths,
                 source_input="https://youtu.be/demo",
                 is_url=True,
                 is_youtube_url=True,
                 metadata={"id": "demo", "title": "Demo"},
                 transcript={"source": "subtitle", "text": "Revenue is up.", "segments": []},
-                ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "artifact_path": "ocr/index.csv", "error": None},
-                segments=[],
-                manifest_entries=[],
+                ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
                 visuals_payload={"slides": [], "charts": []},
                 errors=[],
                 cleanup_intermediates=True,
                 transcript_mode="auto",
-                keyframe_mode="scene+interval",
                 ocr_mode="auto",
-                triage_mode="on",
                 gpt_mode="on",
-                review_mode="off",
-                interval_seconds=60,
-                scene_threshold=0.35,
+                artifacts_mode="minimal",
                 gpt_payload={
                     "model": "gpt-5.4",
                     "report_language": "zh-TW",
@@ -426,7 +371,111 @@ class AnalysisBundleTests(unittest.TestCase):
         self.assertEqual("影片分析報告", payload["gpt"]["final_report"]["title"])
 
 
-class DurableVisualTests(unittest.TestCase):
+class VisualPayloadTests(unittest.TestCase):
+    def test_build_embedded_visuals_exports_only_slides_and_charts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "keyframes").mkdir(parents=True, exist_ok=True)
+            for filename in ("slide.jpg", "chart.jpg", "uncertain.jpg"):
+                (root / "keyframes" / filename).write_bytes(filename.encode("utf-8"))
+            (root / "keyframes" / "chart-2.jpg").write_bytes(b"chart-2")
+
+            frames = [
+                {
+                    "frame_id": "frame-1",
+                    "frame_path": "keyframes/slide.jpg",
+                    "timestamp_seconds": 0.0,
+                    "blur_score": 200.0,
+                    "ocr_text": "Slide OCR",
+                },
+                {
+                    "frame_id": "frame-2",
+                    "frame_path": "keyframes/chart.jpg",
+                    "timestamp_seconds": 1.0,
+                    "blur_score": 250.0,
+                    "ocr_text": "Chart OCR",
+                },
+                {
+                    "frame_id": "frame-4",
+                    "frame_path": "keyframes/chart-2.jpg",
+                    "timestamp_seconds": 1.5,
+                    "blur_score": 150.0,
+                    "ocr_text": "Chart OCR continued",
+                },
+                {
+                    "frame_id": "frame-3",
+                    "frame_path": "keyframes/uncertain.jpg",
+                    "timestamp_seconds": 2.0,
+                    "blur_score": 150.0,
+                    "ocr_text": "Uncertain OCR",
+                },
+            ]
+            segments = [
+                {
+                    "segment_id": "segment-0001",
+                    "heuristic_label": "slides",
+                    "heuristic_confidence": 0.9,
+                    "frame_ids": ["frame-1"],
+                    "representative_frame_paths": ["keyframes/slide.jpg"],
+                    "start_seconds": 0.0,
+                    "end_seconds": 0.0,
+                    "start_hms": "00:00:00",
+                    "end_hms": "00:00:00",
+                    "ocr_summary": "Slide",
+                    "ocr_char_count": 5,
+                    "transcript_window": {"text": "Slide excerpt"},
+                },
+                {
+                    "segment_id": "segment-0002",
+                    "heuristic_label": "chart_table",
+                    "heuristic_confidence": 0.8,
+                    "frame_ids": ["frame-2", "frame-4"],
+                    "representative_frame_paths": ["keyframes/chart.jpg"],
+                    "start_seconds": 1.0,
+                    "end_seconds": 1.0,
+                    "start_hms": "00:00:01",
+                    "end_hms": "00:00:01",
+                    "ocr_summary": "Chart",
+                    "ocr_char_count": 5,
+                    "transcript_window": {"text": "Chart excerpt"},
+                },
+                {
+                    "segment_id": "segment-0003",
+                    "heuristic_label": "uncertain",
+                    "heuristic_confidence": 0.5,
+                    "frame_ids": ["frame-3"],
+                    "representative_frame_paths": ["keyframes/uncertain.jpg"],
+                    "start_seconds": 2.0,
+                    "end_seconds": 2.0,
+                    "start_hms": "00:00:02",
+                    "end_hms": "00:00:02",
+                    "ocr_summary": "Uncertain",
+                    "ocr_char_count": 9,
+                    "transcript_window": {"text": "Uncertain excerpt"},
+                },
+            ]
+            manifest_entries = [
+                {"segment_id": "segment-0001", "effective_label": "slides"},
+                {"segment_id": "segment-0002", "effective_label": "chart_table"},
+                {"segment_id": "segment-0003", "effective_label": "uncertain"},
+            ]
+
+            payload = visuals.build_embedded_visuals(
+                root,
+                frames=frames,
+                segments=segments,
+                manifest_entries=manifest_entries,
+            )
+
+        self.assertEqual(1, len(payload["slides"]))
+        self.assertEqual(1, len(payload["charts"]))
+        self.assertEqual("slide", payload["slides"][0]["effective_label"])
+        self.assertEqual("chart", payload["charts"][0]["effective_label"])
+        self.assertEqual("Slide OCR", payload["slides"][0]["ocr_text"])
+        self.assertEqual("base64", payload["slides"][0]["images"][0]["encoding"])
+        self.assertEqual(1, len(payload["charts"][0]["images"]))
+        self.assertIn("Chart OCR continued", payload["charts"][0]["ocr_text"])
+
     def test_save_durable_visuals_exports_only_slides_and_charts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -440,18 +489,21 @@ class DurableVisualTests(unittest.TestCase):
                     "frame_path": "keyframes/slide.jpg",
                     "timestamp_seconds": 0.0,
                     "blur_score": 200.0,
+                    "ocr_text": "Slide OCR",
                 },
                 {
                     "frame_id": "frame-2",
                     "frame_path": "keyframes/chart.jpg",
                     "timestamp_seconds": 1.0,
                     "blur_score": 250.0,
+                    "ocr_text": "Chart OCR",
                 },
                 {
                     "frame_id": "frame-3",
                     "frame_path": "keyframes/uncertain.jpg",
                     "timestamp_seconds": 2.0,
                     "blur_score": 150.0,
+                    "ocr_text": "Uncertain OCR",
                 },
             ]
             segments = [

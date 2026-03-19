@@ -1,183 +1,238 @@
 # YouTube Analysis Tool
 
-Local-first, token-efficient YouTube analysis.
+Local-first, token-efficient YouTube analysis that produces a single AI-ready `output.json`.
 
-This project is built around a simple idea: the right default is not "send the
-whole video to GPT."
+This project is built around one default: do the cheap work locally first, then
+escalate to GPT only when that extra semantic layer is actually worth paying
+for. A normal run is designed for downstream AI consumption, not for browsing a
+pile of side artifacts by hand.
 
-Instead, it does most of the cheap work locally, keeps only the higher-value
-visual evidence, and treats GPT as an optional escalation step. A default run
-produces a durable per-video `analysis.json` without requiring GPT at all.
+## What The Default Run Gives You
 
-## Why This Is Different
-
-Many video-summary tools follow the same broad pattern:
-
-1. extract a large number of frames
-2. send most or all of them to an LLM
-3. pay the token cost for low-value footage such as talking heads, transitions,
-   or repeated slides
-
-This tool takes a more cost-optimized approach:
-
-- local-first preprocessing before any GPT stage
-- local OCR for candidate frames
-- heuristic triage to separate `slides`, `chart_table`, `talking_head`,
-  `b_roll`, and `uncertain`
-- review and routing artifacts before GPT
-- selective GPT escalation instead of bulk frame submission
-
-The goal is not just "analyze a YouTube video." The goal is to do it without
-wasting vision tokens on frames that do not carry much semantic value.
-
-## What You Get From A Default Run
-
-Running the tool with only `--source`:
+Running `youtube-analyze --source ...` with no extra flags:
 
 - keeps `--gpt off`
-- writes `output/youtube/<video-id-or-stem>/analysis.json`
-- extracts a transcript locally first when possible
-- runs local OCR in `auto` mode when keyframes exist
-- writes triage, review, and routing artifacts
+- keeps `--artifacts minimal`
+- writes `output/youtube/<title-id-or-stem>/output.json`
+- preserves the full transcript inline
+- embeds retained visual evidence inline under `visuals.slides` and `visuals.charts`
+- keeps one inline primary image per retained visual item in minimal mode
 - cleans up large intermediate files after the run
 
-`analysis.json` is the canonical output for each video. It survives cleanup and
-bundles the normalized source metadata, transcript data, OCR status, segment
-summaries, routing state, artifact references, and optional GPT output.
+`output.json` is the canonical durable artifact. In minimal mode it is
+self-contained and does not depend on sibling JSON files, image folders, or
+report files.
 
-## When GPT Is Used
+## Why This Exists
 
-GPT is optional and off by default.
+Many video-analysis tools follow a costly pattern:
 
-When enabled, GPT is intended for higher-semantic tasks such as:
+1. extract lots of frames
+2. send most or all of them to a vision model
+3. pay token cost for repeated slides, talking heads, transitions, and other low-value footage
 
-- interpreting dense slides after OCR
-- reading charts where OCR alone is not enough
-- combining transcript context with selected visual evidence
-- resolving a small `uncertain` bucket after local triage
+This tool takes a different path:
 
-GPT is not the default mechanism for:
+- local transcript extraction first
+- local OCR first
+- local heuristic triage first
+- selective promotion of `slides` and `charts`
+- optional GPT only after the cheap filtering work is done
 
-- full-video frame scanning
-- OCR extraction
-- duplicate removal
-- obvious talking-head suppression
+The goal is not just "analyze a YouTube video." The goal is to reduce
+information overload without wasting tokens on frames that carry little value.
 
-`--gpt off` only disables the GPT vision and report stage. Transcript mode
-`auto` currently means:
+## Output Contract
+
+The canonical output is a single JSON bundle:
+
+```text
+output/youtube/<title-id-or-stem>/
+└── output.json
+```
+
+Top-level shape:
+
+```json
+{
+  "output_version": "2.x",
+  "source": {},
+  "metadata": {},
+  "transcript": {},
+  "visuals": {
+    "slides": [],
+    "charts": []
+  },
+  "processing": {},
+  "errors": [],
+  "gpt": {}
+}
+```
+
+`transcript` contains:
+
+- `source`
+- `language`
+- `full_text`
+- `segments`
+
+`visuals` contains only the AI-facing buckets:
+
+- `slides`
+- `charts`
+
+Each retained visual item includes:
+
+- `segment_id`
+- `effective_label`
+- `heuristic_confidence`
+- timing fields
+- `ocr_text`
+- `ocr_summary`
+- `ocr_char_count`
+- `transcript_excerpt`
+- `images`
+- `primary_image_index`
+
+In minimal mode, `images` normally contains exactly one Base64-embedded primary
+image. The full OCR text stays inline because it is usually more useful to AI
+than extra near-duplicate frames.
+
+## Transcript And OCR Behavior
+
+Default transcript strategy is:
 
 1. subtitles
 2. local Whisper
 3. OpenAI transcription fallback
 
-If you want a fully local run with no OpenAI usage at all, use
-`--transcript subtitles` or `--transcript whisper`.
+If you want a fully local run with no OpenAI usage at all, use:
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --transcript subtitles
+```
+
+or:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --transcript whisper
+```
+
+OCR is always local. The default is `--ocr auto`, which means:
+
+- try OCR when keyframes exist
+- keep going if OCR fails
+- record the degraded state in `output.json`
+
+## Artifact Modes
+
+There are two output modes.
+
+`minimal` is the default:
+
+- writes only `output.json`
+- keeps the canonical bundle self-contained
+- removes trace artifacts after the bundle is assembled
+
+`debug` is opt-in:
+
+- keeps stage artifacts such as `triage/`, `review/`, `routing/`, and `visuals/`
+- keeps `metadata.json`, `transcript.json`, `transcript.txt`, and `source.txt`
+- keeps separate GPT/report artifacts when those stages run
+
+Use debug mode when you want to inspect internals:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --artifacts debug
+```
+
+Large intermediate directories such as `audio/`, `video/`, `subtitles/`,
+`keyframes/`, and `ocr/` are still cleaned by default in both modes unless you
+pass `--keep-intermediates`.
+
+## Folder Naming
+
+For YouTube URLs, the default output folder uses the video title plus the video
+id:
+
+```text
+output/youtube/<title-id>/
+```
+
+This keeps runs readable while still preserving a stable unique suffix. If a
+title is unavailable, the tool falls back to the video id. Local files continue
+to use the file stem.
 
 ## Quick Start
 
-Install the package in editable mode and add the optional YouTube extras:
+Install the package in editable mode with the optional YouTube dependencies:
 
 ```bash
 python3 -m pip install -e '.[youtube]'
 ```
 
-Run it on a YouTube URL:
+Run on a YouTube URL:
 
 ```bash
 youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-Run it on a local file:
+Run on a local file:
 
 ```bash
 youtube-analyze --source /path/to/video.mp4
 ```
 
-Enable GPT only when you actually want the extra semantic layer:
+Enable GPT only when you want the extra semantic layer:
 
 ```bash
 youtube-analyze --source /path/to/video.mp4 --gpt on
 ```
 
-Disable review for batch-style GPT runs:
+Disable interactive review for a more batch-like GPT run:
 
 ```bash
 youtube-analyze --source /path/to/video.mp4 --gpt on --review off
 ```
 
-By default the tool cleans up downloaded media, extracted audio, subtitle files,
-keyframe images, and OCR intermediates after each run. Use
-`--keep-intermediates` if you want to retain them for debugging.
+Keep debug artifacts:
 
-## Output Layout
-
-```text
-output/youtube/<video-id>/
-├── analysis.json
-├── audio/
-├── video/
-├── subtitles/
-├── keyframes/
-│   └── index.csv
-├── ocr/
-│   └── index.csv
-├── triage/
-│   ├── frames.jsonl
-│   └── segments.json
-├── review/
-│   ├── queue.json
-│   └── decisions.json
-├── routing/
-│   └── manifest.json
-├── gpt/
-│   └── analyses.json
-├── report/
-│   ├── report.json
-│   └── report.md
-├── metadata.json
-├── source.txt
-├── transcript.json
-└── transcript.txt
+```bash
+youtube-analyze --source /path/to/video.mp4 --artifacts debug
 ```
 
-After the default cleanup pass, large intermediate directories such as
-`audio/`, `video/`, `subtitles/`, `keyframes/`, and `ocr/` are removed, but
-`analysis.json` and the JSON/TXT stage artifacts remain.
+## Current Local-First Pipeline
 
-## Architecture Notes
+The current implementation does this:
 
-The current architecture is deliberately local-first:
+1. normalize media locally
+2. extract transcript locally first when possible
+3. extract candidate keyframes locally
+4. run local OCR and heuristic frame triage
+5. promote retained visuals into a single AI-friendly bundle
+6. optionally run GPT on the filtered subset
 
-1. inspect and normalize media locally
-2. extract transcript and candidate keyframes locally
-3. run local OCR and heuristic triage
-4. keep representative segments and suppress obvious low-value footage
-5. optionally escalate a small subset to GPT
+The main local tools are:
 
-These stages are good local defaults on a MacBook Air M3 with 24 GB RAM:
-
-- `ffmpeg` / `ffprobe` for media inspection, audio extraction, scene changes,
-  and frame extraction
-- `yt-dlp` for YouTube download and subtitle retrieval
-- local `whisper` for transcript fallback
-- `tesseract` for OCR on candidate frames
-- `opencv` for blur filtering, dedupe, and basic frame heuristics
+- `ffmpeg` / `ffprobe`
+- `yt-dlp`
+- local `whisper`
+- `tesseract`
+- `opencv`
 
 Current implemented behavior includes:
 
 - URL or local-file input
-- output folders under `output/youtube/<video-id-or-stem>/`
-- canonical `analysis.json` artifact per video
+- canonical `output.json` artifact per run
+- full transcript embedded in the canonical output
+- `slides` / `charts` visual galleries embedded in the canonical output
+- one inline primary image per visual item in minimal mode
+- local OCR with `auto|off|on`
 - subtitle-first transcript strategy
 - local Whisper fallback with OpenAI transcription as final fallback
-- scene-change plus interval keyframe extraction
-- local OCR with `auto|off|on` modes
-- heuristic frame triage with dedupe, blur scoring, motion proxy, and routing
-  labels
-- segment merge and transcript-window binding
-- pre-GPT review queue with resumable decisions
-- routing manifest for GPT candidates
+- heuristic triage with dedupe, blur scoring, motion proxy, and routing labels
 - optional GPT segment analysis plus final zh-TW report
+- optional debug-mode trace artifacts
 
 ## Docs
 

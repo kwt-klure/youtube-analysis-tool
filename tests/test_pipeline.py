@@ -77,8 +77,12 @@ class OutputPathTests(unittest.TestCase):
         output = default_output_dir_for_source("/tmp/My Demo Video.mp4")
         self.assertEqual(Path("output/youtube/my-demo-video"), output)
 
-    def test_url_with_id_uses_id(self) -> None:
-        output = default_output_dir_for_source("https://youtu.be/abc123", "AbC_123")
+    def test_url_with_title_and_id_uses_title_id(self) -> None:
+        output = default_output_dir_for_source("https://youtu.be/abc123", "AbC_123", "My Great Talk")
+        self.assertEqual(Path("output/youtube/my-great-talk-abc-123"), output)
+
+    def test_url_without_title_falls_back_to_id(self) -> None:
+        output = default_output_dir_for_source("https://youtu.be/abc123", "AbC_123", None)
         self.assertEqual(Path("output/youtube/abc-123"), output)
 
 
@@ -124,6 +128,7 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual("interactive", args.review)
         self.assertEqual("gpt-5.4", args.gpt_model)
         self.assertEqual("zh-TW", args.report_language)
+        self.assertEqual("minimal", args.artifacts)
         self.assertFalse(args.review_reset)
         self.assertFalse(args.keep_intermediates)
 
@@ -176,6 +181,7 @@ class OcrModeTests(unittest.TestCase):
         state = default_ocr_state("auto")
         self.assertEqual("auto", state["mode"])
         self.assertEqual("not_attempted", state["status"])
+        self.assertNotIn("artifact_path", state)
 
     def test_run_ocr_stage_off_skips_without_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

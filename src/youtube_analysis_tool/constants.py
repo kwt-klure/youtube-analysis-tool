@@ -6,7 +6,8 @@ from pathlib import Path
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_SCENE_THRESHOLD = 0.35
 DEFAULT_OUTPUT_ROOT = Path("output") / "youtube"
-ANALYSIS_VERSION = "1.1"
+OUTPUT_VERSION = "2.1"
+ANALYSIS_VERSION = OUTPUT_VERSION
 SUBTITLE_LANGUAGE_PREFERENCE = (
     "zh-tw",
     "zh-hant",
@@ -25,6 +26,7 @@ DEFAULT_GPT_MODE = "off"
 DEFAULT_REVIEW_MODE = "interactive"
 DEFAULT_GPT_MODEL = "gpt-5.4"
 DEFAULT_REPORT_LANGUAGE = "zh-TW"
+DEFAULT_ARTIFACTS_MODE = "minimal"
 
 # These defaults are intentionally provisional. They are centralized here so
 # calibration can tune them later without rewriting the rule logic.

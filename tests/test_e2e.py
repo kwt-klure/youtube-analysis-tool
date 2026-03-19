@@ -60,7 +60,9 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.gpt_call_count = 0
 
         def fake_materialize_local_input(source_file: Path, paths: pipeline.AnalysisPaths):
-            return {"format": {"duration": "120"}, "streams": [{"codec_type": "video"}]}, source_file
+            metadata = {"format": {"duration": "120"}, "streams": [{"codec_type": "video"}]}
+            write_json(paths.metadata_path, metadata)
+            return metadata, source_file
 
         def fake_extract_audio(_: Path, audio_dir: Path) -> Path:
             audio_path = audio_dir / "source.wav"
@@ -169,21 +171,25 @@ class EndToEndPipelineTests(unittest.TestCase):
             ],
         )
 
-        output_root = pipeline.analyze_source(str(source_path), out_dir=out_dir, gpt_mode="off")
+        output_root = pipeline.analyze_source(
+            str(source_path),
+            out_dir=out_dir,
+            gpt_mode="off",
+            artifacts_mode="debug",
+        )
 
         segments = json.loads((output_root / "triage" / "segments.json").read_text(encoding="utf-8"))["segments"]
         self.assertEqual(1, len(segments))
         self.assertEqual("slides", segments[0]["heuristic_label"])
-        analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
-        self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["segments"][0]["ocr_summary"])
+        analysis = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+        self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["visuals"]["slides"][0]["ocr_summary"])
         self.assertNotIn("gpt", analysis)
         self.assertEqual("subtitle", analysis["transcript"]["source"])
-        self.assertNotIn("text", analysis["transcript"])
-        self.assertNotIn("segments", analysis["transcript"])
+        self.assertEqual("Demo transcript", analysis["transcript"]["full_text"])
+        self.assertEqual(1, len(analysis["transcript"]["segments"]))
         self.assertEqual(1, len(analysis["visuals"]["slides"]))
-        self.assertEqual(1, len(analysis["visuals"]["slides"][0]["image_paths"]))
-        for path in analysis["visuals"]["slides"][0]["image_paths"]:
-            self.assertTrue((output_root / path).exists())
+        self.assertEqual("slide", analysis["visuals"]["slides"][0]["effective_label"])
+        self.assertEqual(1, len(analysis["visuals"]["slides"][0]["images"]))
         self.assertEqual(0, self.gpt_call_count)
 
     def test_chart_heavy_input_saves_durable_chart_visuals(self) -> None:
@@ -199,14 +205,21 @@ class EndToEndPipelineTests(unittest.TestCase):
             phash_by_filename={"chart-1.jpg": "0f0f0f0f0f0f0f0f", "chart-2.jpg": "f0f0f0f0f0f0f0f0"},
         )
 
-        output_root = pipeline.analyze_source(str(source_path), out_dir=out_dir, gpt_mode="off")
+        output_root = pipeline.analyze_source(
+            str(source_path),
+            out_dir=out_dir,
+            gpt_mode="off",
+            artifacts_mode="debug",
+        )
 
-        analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
+        analysis = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
         manifest = json.loads((output_root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(1, len(analysis["visuals"]["charts"]))
-        self.assertEqual(2, len(analysis["visuals"]["charts"][0]["image_paths"]))
-        self.assertEqual(manifest, analysis["visuals"])
-        for path in analysis["visuals"]["charts"][0]["image_paths"]:
+        self.assertEqual("chart", analysis["visuals"]["charts"][0]["effective_label"])
+        self.assertEqual(1, len(analysis["visuals"]["charts"][0]["images"]))
+        self.assertEqual(1, len(manifest["charts"]))
+        self.assertEqual(2, len(manifest["charts"][0]["image_paths"]))
+        for path in manifest["charts"][0]["image_paths"]:
             self.assertTrue((output_root / path).exists())
 
     def test_talking_head_input_yields_no_gpt_candidates(self) -> None:
@@ -226,13 +239,14 @@ class EndToEndPipelineTests(unittest.TestCase):
             out_dir=out_dir,
             gpt_mode="on",
             review_mode="off",
+            artifacts_mode="debug",
         )
 
         manifest = json.loads((output_root / "routing" / "manifest.json").read_text(encoding="utf-8"))["segments"]
         self.assertTrue(manifest)
         self.assertFalse(any(entry["approved_for_gpt"] for entry in manifest))
         self.assertTrue((output_root / "report" / "report.md").exists())
-        analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
+        analysis = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
         self.assertIn("gpt", analysis)
         self.assertEqual("影片分析報告", analysis["gpt"]["final_report"]["title"])
         self.assertEqual([], analysis["visuals"]["slides"])
@@ -262,6 +276,7 @@ class EndToEndPipelineTests(unittest.TestCase):
             out_dir=out_dir,
             gpt_mode="on",
             review_mode="off",
+            artifacts_mode="debug",
         )
 
         manifest = json.loads((output_root / "routing" / "manifest.json").read_text(encoding="utf-8"))["segments"]
@@ -270,7 +285,7 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertEqual("pending_review", uncertain_entries[0]["routing_disposition"])
         self.assertFalse(uncertain_entries[0]["approved_for_gpt"])
 
-    def test_successful_run_cleans_intermediate_dirs_by_default(self) -> None:
+    def test_successful_run_writes_only_output_json_in_minimal_mode(self) -> None:
         source_path, out_dir = self.make_stubbed_run(
             keyframes=[
                 {"kind": "scene", "filename": "slide.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00"},
@@ -287,17 +302,48 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertFalse((output_root / "subtitles").exists())
         self.assertFalse((output_root / "keyframes").exists())
         self.assertFalse((output_root / "ocr").exists())
+        self.assertFalse((output_root / "triage").exists())
+        self.assertFalse((output_root / "routing").exists())
+        self.assertFalse((output_root / "visuals").exists())
+        self.assertFalse((output_root / "report").exists())
+        self.assertFalse((output_root / "gpt").exists())
+        self.assertFalse((output_root / "metadata.json").exists())
+        self.assertFalse((output_root / "transcript.json").exists())
+        analysis = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+        self.assertEqual("minimal", analysis["processing"]["artifact_mode"])
+        self.assertEqual("auto", analysis["processing"]["ocr_mode"])
+        self.assertEqual("completed", analysis["processing"]["ocr_status"])
+        self.assertEqual(1, analysis["processing"]["counts"]["slide_count"])
+        self.assertNotIn("routing", analysis["processing"])
+        self.assertNotIn("artifacts", analysis)
+        self.assertEqual(1, len(analysis["visuals"]["slides"]))
+        self.assertEqual(1, len(analysis["visuals"]["slides"][0]["images"]))
+        self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["visuals"]["slides"][0]["ocr_summary"])
+        self.assertEqual("base64", analysis["visuals"]["slides"][0]["images"][0]["encoding"])
+
+    def test_debug_artifacts_mode_preserves_trace_outputs(self) -> None:
+        source_path, out_dir = self.make_stubbed_run(
+            keyframes=[
+                {"kind": "scene", "filename": "slide.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00"},
+            ],
+            ocr_rows=[
+                {"filename": "slide.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00", "text": "Revenue revenue revenue revenue revenue revenue"},
+            ],
+        )
+
+        output_root = pipeline.analyze_source(
+            str(source_path),
+            out_dir=out_dir,
+            gpt_mode="off",
+            artifacts_mode="debug",
+        )
+
+        self.assertTrue((output_root / "output.json").exists())
         self.assertTrue((output_root / "triage" / "segments.json").exists())
         self.assertTrue((output_root / "routing" / "manifest.json").exists())
         self.assertTrue((output_root / "visuals" / "manifest.json").exists())
-        analysis = json.loads((output_root / "analysis.json").read_text(encoding="utf-8"))
-        self.assertEqual("auto", analysis["ocr"]["mode"])
-        self.assertEqual("completed", analysis["ocr"]["status"])
-        self.assertFalse(analysis["artifacts"]["intermediates"]["keyframes_dir"]["exists"])
-        self.assertEqual("Revenue revenue revenue revenue revenue revenue", analysis["segments"][0]["ocr_summary"])
-        self.assertTrue((output_root / analysis["visuals"]["slides"][0]["primary_image_path"]).exists())
-        manifest = json.loads((output_root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest, analysis["visuals"])
+        self.assertTrue((output_root / "metadata.json").exists())
+        self.assertTrue((output_root / "transcript.json").exists())
 
     def test_failed_run_also_cleans_intermediate_dirs(self) -> None:
         tempdir = tempfile.TemporaryDirectory()
@@ -328,8 +374,10 @@ class EndToEndPipelineTests(unittest.TestCase):
         self.assertFalse((out_dir / "subtitles").exists())
         self.assertFalse((out_dir / "keyframes").exists())
         self.assertFalse((out_dir / "ocr").exists())
-        self.assertTrue((out_dir / "error.json").exists())
-        analysis = json.loads((out_dir / "analysis.json").read_text(encoding="utf-8"))
+        self.assertFalse((out_dir / "error.json").exists())
+        self.assertFalse((out_dir / "metadata.json").exists())
+        self.assertFalse((out_dir / "transcript.json").exists())
+        analysis = json.loads((out_dir / "output.json").read_text(encoding="utf-8"))
         self.assertTrue(analysis["errors"])
         self.assertEqual("boom", analysis["errors"][0]["message"])
 

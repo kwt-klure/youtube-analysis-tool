@@ -22,7 +22,7 @@ from .artifacts import write_json
 @dataclass(frozen=True)
 class AnalysisPaths:
     root: Path
-    analysis_json_path: Path
+    output_json_path: Path
     visuals_dir: Path
     visuals_manifest_path: Path
     visuals_slides_dir: Path
@@ -77,9 +77,17 @@ def hms_from_seconds(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def default_output_dir_for_source(source: str, video_id: str | None = None) -> Path:
+def default_output_dir_for_source(
+    source: str,
+    video_id: str | None = None,
+    video_title: str | None = None,
+) -> Path:
     if video_id:
-        return constants.DEFAULT_OUTPUT_ROOT / slugify(video_id)
+        video_id_slug = slugify(video_id)
+        title_slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(video_title or "")).strip("-").lower()
+        if title_slug:
+            return constants.DEFAULT_OUTPUT_ROOT / f"{title_slug}-{video_id_slug}"
+        return constants.DEFAULT_OUTPUT_ROOT / video_id_slug
     if looks_like_url(source):
         digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
         return constants.DEFAULT_OUTPUT_ROOT / f"url-{digest}"
@@ -89,7 +97,7 @@ def default_output_dir_for_source(source: str, video_id: str | None = None) -> P
 def analysis_paths(root: Path) -> AnalysisPaths:
     return AnalysisPaths(
         root=root,
-        analysis_json_path=root / "analysis.json",
+        output_json_path=root / "output.json",
         visuals_dir=root / "visuals",
         visuals_manifest_path=root / "visuals" / "manifest.json",
         visuals_slides_dir=root / "visuals" / "slides",
@@ -129,12 +137,6 @@ def ensure_dirs(paths: AnalysisPaths, with_ocr: bool = False) -> None:
         paths.video_dir,
         paths.subtitles_dir,
         paths.keyframes_dir,
-        paths.visuals_dir,
-        paths.triage_dir,
-        paths.review_dir,
-        paths.routing_dir,
-        paths.gpt_dir,
-        paths.report_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
     if with_ocr:
@@ -142,13 +144,29 @@ def ensure_dirs(paths: AnalysisPaths, with_ocr: bool = False) -> None:
 
 
 def clear_stale_output_files(paths: AnalysisPaths) -> None:
-    shutil.rmtree(paths.visuals_dir, ignore_errors=True)
-    paths.visuals_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (
+        paths.audio_dir,
+        paths.video_dir,
+        paths.subtitles_dir,
+        paths.keyframes_dir,
+        paths.ocr_dir,
+        paths.triage_dir,
+        paths.review_dir,
+        paths.routing_dir,
+        paths.gpt_dir,
+        paths.report_dir,
+        paths.visuals_dir,
+        paths.root / "tmp-whisper",
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
     for path in (
+        paths.output_json_path,
+        paths.root / "analysis.json",
+        paths.metadata_path,
+        paths.source_path,
+        paths.transcript_json_path,
+        paths.transcript_text_path,
         paths.error_path,
-        paths.gpt_analyses_path,
-        paths.report_json_path,
-        paths.report_markdown_path,
     ):
         path.unlink(missing_ok=True)
 
@@ -638,7 +656,6 @@ def default_ocr_state(ocr_mode: str) -> dict[str, Any]:
         "status": "not_attempted",
         "attempted": False,
         "frame_count": 0,
-        "artifact_path": "ocr/index.csv",
         "error": None,
     }
 
@@ -838,6 +855,26 @@ def cleanup_intermediate_artifacts(paths: AnalysisPaths) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def cleanup_non_debug_artifacts(paths: AnalysisPaths) -> None:
+    for directory in (
+        paths.triage_dir,
+        paths.review_dir,
+        paths.routing_dir,
+        paths.gpt_dir,
+        paths.report_dir,
+        paths.visuals_dir,
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
+    for path in (
+        paths.metadata_path,
+        paths.source_path,
+        paths.transcript_json_path,
+        paths.transcript_text_path,
+        paths.error_path,
+    ):
+        path.unlink(missing_ok=True)
+
+
 def analyze_source(
     source: str,
     *,
@@ -852,6 +889,7 @@ def analyze_source(
     review_mode: str = constants.DEFAULT_REVIEW_MODE,
     gpt_model: str = constants.DEFAULT_GPT_MODEL,
     report_language: str = constants.DEFAULT_REPORT_LANGUAGE,
+    artifacts_mode: str = constants.DEFAULT_ARTIFACTS_MODE,
     review_reset: bool = False,
     cleanup_intermediates: bool = True,
     review_input: Callable[[str], str] = input,
@@ -860,10 +898,14 @@ def analyze_source(
     metadata_hint: dict[str, Any] | None = None
     if looks_like_url(source):
         metadata_hint = fetch_youtube_metadata(source)
-    output_root = out_dir or default_output_dir_for_source(source, (metadata_hint or {}).get("id"))
+    output_root = out_dir or default_output_dir_for_source(
+        source,
+        (metadata_hint or {}).get("id"),
+        (metadata_hint or {}).get("title"),
+    )
     paths = analysis_paths(output_root)
-    ensure_dirs(paths)
     clear_stale_output_files(paths)
+    ensure_dirs(paths)
     ensure_source_file(paths, source)
     metadata: dict[str, Any] = {}
     transcript: dict[str, Any] | None = None
@@ -946,14 +988,22 @@ def analyze_source(
             write_json(paths.review_decisions_path, {"decisions": decisions})
             write_json(paths.routing_manifest_path, {"segments": manifest_entries})
         else:
+            segments = []
             write_empty_stage_artifacts(paths)
 
-        visuals_payload = visuals.save_durable_visuals(
+        visuals_payload = visuals.build_embedded_visuals(
             paths.root,
             frames=frames,
             segments=segments,
             manifest_entries=manifest_entries,
         )
+        if artifacts_mode == "debug":
+            visuals.save_durable_visuals(
+                paths.root,
+                frames=frames,
+                segments=segments,
+                manifest_entries=manifest_entries,
+            )
 
         if gpt_mode == "on":
             approved_entries = [entry for entry in manifest_entries if entry.get("approved_for_gpt")]
@@ -983,7 +1033,7 @@ def analyze_source(
     finally:
         if cleanup_intermediates:
             cleanup_intermediate_artifacts(paths)
-        reporting.write_analysis_file(
+        reporting.write_output_file(
             paths,
             source_input=source,
             is_url=looks_like_url(source),
@@ -991,21 +1041,17 @@ def analyze_source(
             metadata=metadata,
             transcript=transcript,
             ocr=ocr_state,
-            segments=segments,
-            manifest_entries=manifest_entries,
             visuals_payload=visuals_payload,
             errors=errors,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
-            keyframe_mode=keyframe_mode,
             ocr_mode=ocr_mode,
-            triage_mode=triage_mode,
             gpt_mode=gpt_mode,
-            review_mode=review_mode,
-            interval_seconds=interval_seconds,
-            scene_threshold=scene_threshold,
+            artifacts_mode=artifacts_mode,
             gpt_payload=gpt_payload,
         )
+        if artifacts_mode == "minimal":
+            cleanup_non_debug_artifacts(paths)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1060,6 +1106,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Human-facing report language",
     )
     parser.add_argument(
+        "--artifacts",
+        default=constants.DEFAULT_ARTIFACTS_MODE,
+        choices=["minimal", "debug"],
+        help="Artifact output mode (`minimal` keeps only output.json, `debug` preserves stage artifacts)",
+    )
+    parser.add_argument(
         "--review-reset",
         action="store_true",
         help="Ignore any saved review decisions and start review from scratch",
@@ -1104,6 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
         review_mode=args.review,
         gpt_model=args.gpt_model,
         report_language=args.report_language,
+        artifacts_mode=args.artifacts,
         review_reset=args.review_reset,
         cleanup_intermediates=not args.keep_intermediates,
     )
