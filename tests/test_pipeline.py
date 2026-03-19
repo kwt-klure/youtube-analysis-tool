@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 from youtube_analysis_tool.pipeline import (
     analyze_source,
     analysis_paths,
+    burned_subtitle_quality_is_insufficient,
     cleanup_intermediate_artifacts,
     choose_subtitle_file,
     choose_subtitle_track_from_metadata,
@@ -198,6 +199,7 @@ class CliArgumentTests(unittest.TestCase):
         args = parse_args(["--source", "/tmp/demo.mp4"])
 
         self.assertEqual("auto", args.ocr)
+        self.assertEqual("auto", args.burned_subtitles)
         self.assertEqual("on", args.triage)
         self.assertEqual("off", args.gpt)
         self.assertEqual("interactive", args.review)
@@ -396,6 +398,196 @@ class TranscriptPolicyTests(unittest.TestCase):
         self.assertEqual(output_root, result)
         subtitle_mock.assert_called_once()
         extract_audio_mock.assert_not_called()
+
+    def test_subtitles_mode_does_not_run_burned_subtitle_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.ja.auto.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_auto", "language": "ja", "text": "subtitle text", "segments": []}
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_burned_subtitles_stage"
+            ) as burned_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="subtitles",
+                    cleanup_intermediates=False,
+                )
+
+        burned_mock.assert_not_called()
+
+    def test_auto_mode_uses_burned_subtitle_ocr_before_audio_transcription(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            burned_transcript = {
+                "source": "burned_subtitle_ocr",
+                "language": None,
+                "text": "燒錄字幕",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "燒錄字幕"}],
+            }
+            burned_state = {
+                "mode": "auto",
+                "status": "completed",
+                "attempted": True,
+                "probe_passed": True,
+                "ocr_event_count": 12,
+                "error": None,
+            }
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({"streams": [{"codec_type": "video"}]}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_burned_subtitles_stage",
+                return_value=(burned_transcript, burned_state),
+            ) as burned_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_strategy_auto"
+            ) as strategy_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="auto",
+                    cleanup_intermediates=False,
+                )
+
+        burned_mock.assert_called_once()
+        extract_audio_mock.assert_not_called()
+        strategy_mock.assert_not_called()
+
+    def test_whisper_mode_falls_back_to_whisper_when_burned_ocr_quality_is_poor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            whisper_transcript = {
+                "source": "whisper",
+                "language": "zh",
+                "text": "Whisper transcript",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Whisper transcript"}],
+            }
+            burned_state = {
+                "mode": "auto",
+                "status": "fallback_to_whisper",
+                "attempted": True,
+                "probe_passed": True,
+                "ocr_event_count": 5,
+                "error": None,
+            }
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({"streams": [{"codec_type": "video"}]}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_burned_subtitles_stage",
+                return_value=(None, burned_state),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio",
+                return_value=Path(tmpdir) / "audio.wav",
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper",
+                return_value=whisper_transcript,
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="whisper",
+                    cleanup_intermediates=False,
+                )
+
+        extract_audio_mock.assert_called_once()
+        whisper_mock.assert_called_once()
+
+    def test_api_mode_uses_burned_subtitle_ocr_before_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            burned_transcript = {
+                "source": "burned_subtitle_ocr",
+                "language": None,
+                "text": "燒錄字幕",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "燒錄字幕"}],
+            }
+            burned_state = {
+                "mode": "on",
+                "status": "completed",
+                "attempted": True,
+                "probe_passed": True,
+                "ocr_event_count": 9,
+                "error": None,
+            }
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({"streams": [{"codec_type": "video"}]}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_burned_subtitles_stage",
+                return_value=(burned_transcript, burned_state),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+            ) as openai_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="api",
+                    cleanup_intermediates=False,
+                )
+
+        extract_audio_mock.assert_not_called()
+        openai_mock.assert_not_called()
+
+    def test_burned_subtitle_quality_gate_detects_insufficient_signal(self) -> None:
+        self.assertTrue(
+            burned_subtitle_quality_is_insufficient(
+                ocr_event_count=10,
+                nonempty_hits=3,
+                cjk_char_count=80,
+            )
+        )
+        self.assertFalse(
+            burned_subtitle_quality_is_insufficient(
+                ocr_event_count=12,
+                nonempty_hits=8,
+                cjk_char_count=140,
+            )
+        )
 
 
 class OcrModeTests(unittest.TestCase):

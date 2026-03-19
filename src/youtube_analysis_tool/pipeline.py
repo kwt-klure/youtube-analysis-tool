@@ -22,6 +22,11 @@ from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
 
 
+CJK_CHARACTER_PATTERN = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]"
+)
+
+
 @dataclass(frozen=True)
 class AnalysisPaths:
     root: Path
@@ -610,6 +615,397 @@ def transcript_from_subtitles(subtitle_path: Path, paths: AnalysisPaths) -> dict
     return transcript
 
 
+def default_burned_subtitles_state(mode: str) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "status": "not_attempted",
+        "attempted": False,
+        "probe_passed": False,
+        "ocr_event_count": 0,
+        "error": None,
+    }
+
+
+def video_dimensions(metadata: dict[str, Any]) -> tuple[int, int] | None:
+    for stream in metadata.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        width = stream.get("width")
+        height = stream.get("height")
+        if width and height:
+            return int(width), int(height)
+    return None
+
+
+def burned_subtitle_crop_geometry(metadata: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    dimensions = video_dimensions(metadata)
+    if dimensions is None:
+        return None
+    width, height = dimensions
+    crop_width = max(1, int(round(width * (1.0 - (constants.DEFAULT_BURNED_SUBTITLE_SIDE_MARGIN_RATIO * 2.0)))))
+    crop_height = max(1, int(round(height * constants.DEFAULT_BURNED_SUBTITLE_BAND_HEIGHT_RATIO)))
+    crop_x = max(0, int(round(width * constants.DEFAULT_BURNED_SUBTITLE_SIDE_MARGIN_RATIO)))
+    crop_y = max(0, height - crop_height)
+    return crop_width, crop_height, crop_x, crop_y
+
+
+def count_cjk_characters(text: str) -> int:
+    return len(CJK_CHARACTER_PATTERN.findall(str(text or "")))
+
+
+def normalize_burned_subtitle_text(text: str) -> str:
+    normalized = clean_caption_text([str(text or "").replace("\u3000", " ")])
+    return normalized.strip()
+
+
+def is_effective_burned_subtitle_text(text: str) -> bool:
+    return count_cjk_characters(text) >= constants.DEFAULT_BURNED_SUBTITLE_MIN_EFFECTIVE_CJK_CHARS
+
+
+def available_tesseract_languages() -> set[str]:
+    tesseract_bin = shutil.which("tesseract")
+    if tesseract_bin is None:
+        return set()
+    result = run_command([tesseract_bin, "--list-langs"])
+    languages: set[str] = set()
+    for line in result.stdout.splitlines():
+        token = line.strip()
+        if not token or token.lower().startswith("list of available languages"):
+            continue
+        languages.add(token)
+    return languages
+
+
+def choose_burned_subtitle_tesseract_languages() -> str | None:
+    available = available_tesseract_languages()
+    cjk_languages = [language for language in constants.BURNED_SUBTITLE_TESSERACT_LANGS if language in available]
+    if not cjk_languages:
+        return None
+    optional_languages = [
+        language
+        for language in constants.BURNED_SUBTITLE_OPTIONAL_TESSERACT_LANGS
+        if language in available
+    ]
+    return "+".join(cjk_languages + optional_languages)
+
+
+def iter_subtitle_band_frames(
+    video_path: Path,
+    metadata: dict[str, Any],
+    *,
+    sample_fps: float,
+    duration_limit: float | None = None,
+):
+    import numpy
+
+    geometry = burned_subtitle_crop_geometry(metadata)
+    if geometry is None:
+        raise RuntimeError("Unable to determine subtitle band geometry from video metadata.")
+    crop_width, crop_height, crop_x, crop_y = geometry
+    frame_size = crop_width * crop_height
+    if frame_size <= 0:
+        raise RuntimeError("Computed subtitle band geometry is invalid.")
+
+    filter_parts = [
+        f"fps={sample_fps}",
+        f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}",
+        "format=gray",
+    ]
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+    ]
+    if duration_limit is not None and duration_limit > 0:
+        command.extend(["-t", str(duration_limit)])
+    command.extend(
+        [
+            "-vf",
+            ",".join(filter_parts),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ]
+    )
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("Failed to open ffmpeg pipe for burned subtitle OCR.")
+
+    sample_interval = 1.0 / sample_fps
+    frame_index = 0
+    stderr_text = ""
+    try:
+        while True:
+            chunk = process.stdout.read(frame_size)
+            if not chunk:
+                break
+            if len(chunk) < frame_size:
+                break
+            image = numpy.frombuffer(chunk, dtype=numpy.uint8).reshape((crop_height, crop_width))
+            yield {
+                "frame_index": frame_index,
+                "timestamp_seconds": round(frame_index * sample_interval, 3),
+                "image": image,
+            }
+            frame_index += 1
+    finally:
+        process.stdout.close()
+        stderr_text = process.stderr.read().decode("utf-8", errors="ignore")
+        process.stderr.close()
+        return_code = process.wait()
+        if return_code not in {0, None}:
+            message = stderr_text.strip() or f"ffmpeg exited with code {return_code}"
+            raise RuntimeError(f"Burned subtitle frame extraction failed: {message}")
+
+
+def preprocess_burned_subtitle_image(image):
+    import cv2
+
+    if image is None:
+        raise RuntimeError("Subtitle band image is empty.")
+    if len(image.shape) == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresholded = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.resize(thresholded, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+
+
+def subtitle_band_diff(left, right) -> float:
+    import numpy
+
+    if left is None or right is None:
+        return 1.0
+    if left.shape != right.shape:
+        return 1.0
+    return float(numpy.mean(numpy.abs(left.astype("float32") - right.astype("float32"))) / 255.0)
+
+
+def ocr_burned_subtitle_image(image, *, lang: str) -> str:
+    import pytesseract
+
+    text = pytesseract.image_to_string(image, lang=lang, config="--psm 6")
+    return normalize_burned_subtitle_text(text)
+
+
+def probe_burned_subtitles(
+    video_path: Path,
+    metadata: dict[str, Any],
+    *,
+    tesseract_langs: str,
+) -> dict[str, Any]:
+    hits = 0
+    distinct_texts: list[str] = []
+    sample_count = 0
+    probe_fps = constants.DEFAULT_BURNED_SUBTITLE_PROBE_SAMPLES / constants.DEFAULT_BURNED_SUBTITLE_PROBE_DURATION_SECONDS
+    for frame in iter_subtitle_band_frames(
+        video_path,
+        metadata,
+        sample_fps=probe_fps,
+        duration_limit=constants.DEFAULT_BURNED_SUBTITLE_PROBE_DURATION_SECONDS,
+    ):
+        sample_count += 1
+        text = ocr_burned_subtitle_image(
+            preprocess_burned_subtitle_image(frame["image"]),
+            lang=tesseract_langs,
+        )
+        if not is_effective_burned_subtitle_text(text):
+            continue
+        hits += 1
+        if text not in distinct_texts:
+            distinct_texts.append(text)
+    passed = (
+        hits >= constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_HITS
+        and len(distinct_texts) >= constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_DISTINCT_TEXTS
+    )
+    return {
+        "passed": passed,
+        "sample_count": sample_count,
+        "hits": hits,
+        "distinct_text_count": len(distinct_texts),
+    }
+
+
+def burned_subtitle_quality_is_insufficient(
+    *,
+    ocr_event_count: int,
+    nonempty_hits: int,
+    cjk_char_count: int,
+) -> bool:
+    hit_rate = 0.0 if ocr_event_count <= 0 else (nonempty_hits / ocr_event_count)
+    return (
+        nonempty_hits < constants.DEFAULT_BURNED_SUBTITLE_MIN_NONEMPTY_HITS
+        or hit_rate < constants.DEFAULT_BURNED_SUBTITLE_MIN_HIT_RATE
+        or cjk_char_count < constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_CHARS
+    )
+
+
+def transcribe_burned_subtitles(
+    video_path: Path,
+    metadata: dict[str, Any],
+    *,
+    tesseract_langs: str,
+) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    current_text: str | None = None
+    current_start: float | None = None
+    current_end: float | None = None
+    previous_image = None
+    sample_interval = 1.0 / constants.DEFAULT_BURNED_SUBTITLE_SAMPLE_FPS
+    ocr_event_count = 0
+    nonempty_hits = 0
+    cjk_char_count = 0
+    quality_gate_checked = False
+
+    def close_segment() -> None:
+        nonlocal current_text, current_start, current_end
+        if current_text and current_start is not None and current_end is not None:
+            segments.append(
+                {
+                    "start": round(current_start, 3),
+                    "end": round(current_end, 3),
+                    "text": current_text,
+                }
+            )
+        current_text = None
+        current_start = None
+        current_end = None
+
+    def should_fail_quality_gate(force: bool, timestamp_seconds: float) -> bool:
+        nonlocal quality_gate_checked
+        if quality_gate_checked:
+            return False
+        if not force and (
+            timestamp_seconds < constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_SECONDS
+            and ocr_event_count < constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_EVENTS
+        ):
+            return False
+        quality_gate_checked = True
+        return burned_subtitle_quality_is_insufficient(
+            ocr_event_count=ocr_event_count,
+            nonempty_hits=nonempty_hits,
+            cjk_char_count=cjk_char_count,
+        )
+
+    for frame in iter_subtitle_band_frames(
+        video_path,
+        metadata,
+        sample_fps=constants.DEFAULT_BURNED_SUBTITLE_SAMPLE_FPS,
+    ):
+        timestamp_seconds = float(frame["timestamp_seconds"])
+        processed_image = preprocess_burned_subtitle_image(frame["image"])
+        if previous_image is not None:
+            difference = subtitle_band_diff(previous_image, processed_image)
+            if difference < constants.DEFAULT_BURNED_SUBTITLE_DIFF_THRESHOLD:
+                if current_text:
+                    current_end = round(timestamp_seconds + sample_interval, 3)
+                continue
+        previous_image = processed_image
+        ocr_event_count += 1
+        text = ocr_burned_subtitle_image(processed_image, lang=tesseract_langs)
+        effective_text = text if is_effective_burned_subtitle_text(text) else ""
+        if effective_text:
+            nonempty_hits += 1
+            cjk_char_count += count_cjk_characters(effective_text)
+
+        if effective_text == current_text and current_text:
+            current_end = round(timestamp_seconds + sample_interval, 3)
+        else:
+            close_segment()
+            if effective_text:
+                current_text = effective_text
+                current_start = timestamp_seconds
+                current_end = round(timestamp_seconds + sample_interval, 3)
+
+        if should_fail_quality_gate(False, timestamp_seconds):
+            return {
+                "segments": [],
+                "ocr_event_count": ocr_event_count,
+                "status": "fallback_to_whisper",
+            }
+
+    if should_fail_quality_gate(True, constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_SECONDS):
+        return {
+            "segments": [],
+            "ocr_event_count": ocr_event_count,
+            "status": "fallback_to_whisper",
+        }
+
+    close_segment()
+    return {
+        "segments": segments,
+        "ocr_event_count": ocr_event_count,
+        "status": "completed",
+    }
+
+
+def run_burned_subtitles_stage(
+    video_path: Path | None,
+    metadata: dict[str, Any],
+    paths: AnalysisPaths,
+    *,
+    mode: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    state = default_burned_subtitles_state(mode)
+    if mode == "off":
+        state["status"] = "disabled"
+        return None, state
+    resolved_metadata = metadata
+    if video_path is not None and (
+        not has_video_stream(resolved_metadata) or video_dimensions(resolved_metadata) is None
+    ):
+        try:
+            resolved_metadata = ffprobe_json(video_path)
+        except Exception:
+            pass
+    if video_path is None or not has_video_stream(resolved_metadata):
+        state["status"] = "not_applicable"
+        return None, state
+
+    state["attempted"] = True
+    tesseract_langs = choose_burned_subtitle_tesseract_languages()
+    if tesseract_langs is None:
+        state["status"] = "missing_language_pack"
+        return None, state
+
+    try:
+        if mode == "auto":
+            probe = probe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs)
+            state["probe_passed"] = bool(probe["passed"])
+            if not probe["passed"]:
+                state["status"] = "probe_rejected"
+                return None, state
+        else:
+            state["probe_passed"] = True
+
+        result = transcribe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs)
+        state["ocr_event_count"] = int(result["ocr_event_count"])
+        if result["status"] != "completed":
+            state["status"] = str(result["status"])
+            return None, state
+
+        transcript = transcript_from_segments(
+            result["segments"],
+            source="burned_subtitle_ocr",
+            language=None,
+        )
+        write_transcript(paths, transcript)
+        state["status"] = "completed"
+        return transcript, state
+    except Exception as exc:
+        state["status"] = "failed"
+        state["error"] = str(exc)
+        return None, state
+
+
 def extract_audio(input_media_path: Path, audio_dir: Path) -> Path:
     audio_path = audio_dir / "source.wav"
     run_command(
@@ -1079,6 +1475,7 @@ def analyze_source(
     transcript_mode: str = "auto",
     keyframe_mode: str = "scene+interval",
     ocr_mode: str = constants.DEFAULT_OCR_MODE,
+    burned_subtitles_mode: str = constants.DEFAULT_BURNED_SUBTITLES_MODE,
     out_dir: Path | None = None,
     interval_seconds: int = constants.DEFAULT_INTERVAL_SECONDS,
     scene_threshold: float = constants.DEFAULT_SCENE_THRESHOLD,
@@ -1108,6 +1505,7 @@ def analyze_source(
     metadata: dict[str, Any] = {}
     transcript: dict[str, Any] | None = None
     ocr_state = default_ocr_state(ocr_mode)
+    burned_subtitles_state = default_burned_subtitles_state(burned_subtitles_mode)
     frames: list[dict[str, Any]] = []
     segments: list[dict[str, Any]] = []
     manifest_entries: list[dict[str, Any]] = []
@@ -1131,13 +1529,28 @@ def analyze_source(
         if transcript_mode in {"auto", "subtitles", "whisper", "api"}:
             subtitle_transcript = transcript_from_preferred_subtitles(paths)
 
-        normalized_audio: Path | None = None
+        burned_subtitle_transcript = None
         if subtitle_transcript is None and transcript_mode in {"auto", "whisper", "api"}:
+            burned_subtitle_transcript, burned_subtitles_state = run_burned_subtitles_stage(
+                video_path,
+                metadata,
+                paths,
+                mode=burned_subtitles_mode,
+            )
+
+        normalized_audio: Path | None = None
+        if (
+            subtitle_transcript is None
+            and burned_subtitle_transcript is None
+            and transcript_mode in {"auto", "whisper", "api"}
+        ):
             normalized_audio = extract_audio(audio_input, paths.audio_dir)
 
         if transcript_mode == "auto":
             if subtitle_transcript is not None:
                 transcript = subtitle_transcript
+            elif burned_subtitle_transcript is not None:
+                transcript = burned_subtitle_transcript
             else:
                 transcript = transcript_strategy_auto(normalized_audio, paths)
         elif transcript_mode == "subtitles":
@@ -1147,11 +1560,15 @@ def analyze_source(
         elif transcript_mode == "api":
             if subtitle_transcript is not None:
                 transcript = subtitle_transcript
+            elif burned_subtitle_transcript is not None:
+                transcript = burned_subtitle_transcript
             else:
                 transcript = transcribe_with_openai_skill(normalized_audio, paths)
         elif transcript_mode == "whisper":
             if subtitle_transcript is not None:
                 transcript = subtitle_transcript
+            elif burned_subtitle_transcript is not None:
+                transcript = burned_subtitle_transcript
             else:
                 transcript = transcribe_with_whisper(normalized_audio, paths)
         else:
@@ -1258,6 +1675,7 @@ def analyze_source(
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
             ocr_mode=ocr_mode,
+            burned_subtitles=burned_subtitles_state,
             gpt_mode=gpt_mode,
             artifacts_mode=artifacts_mode,
             gpt_payload=gpt_payload,
@@ -1288,6 +1706,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=constants.DEFAULT_OCR_MODE,
         choices=["auto", "off", "on"],
         help="Run local OCR on keyframes (`auto` is best-effort and non-fatal)",
+    )
+    parser.add_argument(
+        "--burned-subtitles",
+        default=constants.DEFAULT_BURNED_SUBTITLES_MODE,
+        choices=["auto", "off", "on"],
+        help="Fallback OCR for fixed burned-in CJK subtitle bands when no text-track subtitles exist",
     )
     parser.add_argument(
         "--triage",
@@ -1360,6 +1784,7 @@ def main(argv: list[str] | None = None) -> int:
         transcript_mode=args.transcript,
         keyframe_mode=args.keyframes,
         ocr_mode=args.ocr,
+        burned_subtitles_mode=args.burned_subtitles,
         out_dir=args.out_dir,
         interval_seconds=args.interval_seconds,
         scene_threshold=args.scene_threshold,
