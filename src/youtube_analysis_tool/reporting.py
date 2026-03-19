@@ -102,6 +102,50 @@ def normalize_transcript_segments(segments: list[dict[str, Any]] | None) -> list
     return normalized
 
 
+def transcript_extraction_kind(source: str | None) -> str | None:
+    value = str(source or "")
+    if value in {"subtitle", "subtitle_manual", "subtitle_auto"}:
+        return "text_track"
+    if value == "burned_subtitle_ocr":
+        return "frame_ocr"
+    if value == "whisper":
+        return "local_asr"
+    if value == "openai":
+        return "remote_asr"
+    if not value:
+        return None
+    return "unknown"
+
+
+def transcript_quality_notes(source: str | None) -> list[str]:
+    value = str(source or "")
+    if value in {"subtitle", "subtitle_manual"}:
+        return []
+    if value == "subtitle_auto":
+        return ["machine_generated_text_track"]
+    if value == "burned_subtitle_ocr":
+        return ["frame_ocr_may_be_noisy"]
+    if value == "whisper":
+        return ["local_asr_may_mishear_proper_nouns"]
+    if value == "openai":
+        return ["remote_asr_may_mishear_proper_nouns"]
+    if not value:
+        return ["transcript_missing"]
+    return ["transcript_source_unknown"]
+
+
+def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[str, Any]:
+    transcript = transcript or {}
+    source = transcript.get("source")
+    extraction_kind = transcript_extraction_kind(source)
+    return {
+        "source": source,
+        "extraction_kind": extraction_kind,
+        "is_direct_text_track": extraction_kind == "text_track",
+        "quality_notes": transcript_quality_notes(source),
+    }
+
+
 def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
     transcript = transcript or {}
     return {
@@ -109,6 +153,79 @@ def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
         "language": transcript.get("language"),
         "full_text": transcript.get("text", ""),
         "segments": normalize_transcript_segments(transcript.get("segments")),
+        "segment_count": transcript.get("segment_count", len(transcript.get("segments") or [])),
+        "provenance": normalize_transcript_provenance(transcript),
+    }
+
+
+def summarize_visual_bucket_provenance(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "count": len(items),
+        "segment_ids": [item.get("segment_id") for item in items if item.get("segment_id")],
+    }
+
+
+def normalize_visual_item(item: dict[str, Any], *, bucket: str) -> dict[str, Any]:
+    canonical_label = "slide" if bucket == "slides" else "chart"
+    source_segment_ref = item.get("source_segment_ref") or {
+        "segment_id": item.get("segment_id"),
+        "artifact_path": "triage/segments.json",
+        "visual_bucket": bucket,
+    }
+    provenance = item.get("provenance") or {
+        "selection_kind": "heuristic_segment_promotion",
+        "effective_label_source": "routing_label_after_review_or_heuristic_fallback",
+        "timing_source": "triage_segment",
+        "ocr_text_source": "frame_ocr_aggregate",
+        "transcript_excerpt_source": "transcript_window_text",
+        "image_source": "representative_or_first_available_frame",
+        "quality_notes": [
+            "effective label is a routing/debug label, not semantic understanding",
+            f"visual is grouped into canonical {canonical_label} bucket for downstream AI consumption",
+        ],
+    }
+    normalized = dict(item)
+    normalized["source_segment_ref"] = source_segment_ref
+    normalized["provenance"] = provenance
+    return normalized
+
+
+def normalize_visuals_payload(
+    visuals_payload: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    visuals_payload = visuals_payload or {}
+    return {
+        "slides": [
+            normalize_visual_item(item, bucket="slides")
+            for item in visuals_payload.get("slides", [])
+        ],
+        "charts": [
+            normalize_visual_item(item, bucket="charts")
+            for item in visuals_payload.get("charts", [])
+        ],
+    }
+
+
+def summarize_provenance(
+    *,
+    transcript: dict[str, Any] | None,
+    visuals_payload: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "extraction_kind": "direct_metadata_extract",
+            "quality_notes": [],
+        },
+        "transcript": normalize_transcript_provenance(transcript),
+        "visuals": {
+            "selection_kind": "heuristic_segment_promotion",
+            "quality_notes": [
+                "visual labels are heuristic routing labels",
+                "visual timing is aligned to triage segments",
+            ],
+            "slides": summarize_visual_bucket_provenance(visuals_payload.get("slides", [])),
+            "charts": summarize_visual_bucket_provenance(visuals_payload.get("charts", [])),
+        },
     }
 
 
@@ -134,6 +251,9 @@ def summarize_processing(
         "cleanup_applied": cleanup_intermediates,
         "ocr_status": ocr.get("status"),
         "burned_subtitles_status": burned_subtitles.get("status"),
+        "burned_subtitles_reason": burned_subtitles.get("reason"),
+        "burned_subtitles_probe_hits": burned_subtitles.get("probe_hits", 0),
+        "burned_subtitles_ocr_events": burned_subtitles.get("ocr_event_count", 0),
         "counts": {
             "transcript_segments": len((transcript or {}).get("segments", [])),
             "slide_count": len(visuals_payload.get("slides", [])),
@@ -161,6 +281,7 @@ def build_output_payload(
     artifacts_mode: str,
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    normalized_visuals = normalize_visuals_payload(visuals_payload)
     payload = {
         "output_version": constants.OUTPUT_VERSION,
         "source": normalize_source(
@@ -170,18 +291,22 @@ def build_output_payload(
         ),
         "metadata": normalize_metadata(metadata),
         "transcript": normalize_transcript(transcript),
-        "visuals": visuals_payload,
+        "visuals": normalized_visuals,
         "processing": summarize_processing(
             transcript=transcript,
             ocr=ocr,
             burned_subtitles=burned_subtitles,
-            visuals_payload=visuals_payload,
+            visuals_payload=normalized_visuals,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
             ocr_mode=ocr_mode,
             gpt_mode=gpt_mode,
             artifacts_mode=artifacts_mode,
             errors=errors,
+        ),
+        "provenance": summarize_provenance(
+            transcript=transcript,
+            visuals_payload=normalized_visuals,
         ),
         "errors": errors,
     }

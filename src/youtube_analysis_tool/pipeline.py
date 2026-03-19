@@ -22,9 +22,10 @@ from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
 
 
-CJK_CHARACTER_PATTERN = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]"
-)
+HAN_CHARACTER_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+LATIN_CHARACTER_PATTERN = re.compile(r"[A-Za-z]")
+DIGIT_CHARACTER_PATTERN = re.compile(r"\d")
+VISIBLE_CHARACTER_PATTERN = re.compile(r"\S")
 
 
 @dataclass(frozen=True)
@@ -619,8 +620,10 @@ def default_burned_subtitles_state(mode: str) -> dict[str, Any]:
     return {
         "mode": mode,
         "status": "not_attempted",
+        "reason": None,
         "attempted": False,
         "probe_passed": False,
+        "probe_hits": 0,
         "ocr_event_count": 0,
         "error": None,
     }
@@ -650,7 +653,7 @@ def burned_subtitle_crop_geometry(metadata: dict[str, Any]) -> tuple[int, int, i
 
 
 def count_cjk_characters(text: str) -> int:
-    return len(CJK_CHARACTER_PATTERN.findall(str(text or "")))
+    return len(HAN_CHARACTER_PATTERN.findall(str(text or "")))
 
 
 def normalize_burned_subtitle_text(text: str) -> str:
@@ -658,8 +661,38 @@ def normalize_burned_subtitle_text(text: str) -> str:
     return normalized.strip()
 
 
+def burned_subtitle_text_metrics(text: str) -> dict[str, float]:
+    normalized = str(text or "").strip()
+    visible_char_count = len(VISIBLE_CHARACTER_PATTERN.findall(normalized))
+    cjk_char_count = count_cjk_characters(normalized)
+    latin_char_count = len(LATIN_CHARACTER_PATTERN.findall(normalized))
+    digit_char_count = len(DIGIT_CHARACTER_PATTERN.findall(normalized))
+    symbol_count = max(0, visible_char_count - cjk_char_count - latin_char_count - digit_char_count)
+    if visible_char_count <= 0:
+        cjk_ratio = 0.0
+        noise_ratio = 1.0
+    else:
+        cjk_ratio = cjk_char_count / visible_char_count
+        noise_ratio = symbol_count / visible_char_count
+    return {
+        "visible_char_count": float(visible_char_count),
+        "cjk_char_count": float(cjk_char_count),
+        "latin_char_count": float(latin_char_count),
+        "digit_char_count": float(digit_char_count),
+        "symbol_count": float(symbol_count),
+        "cjk_ratio": float(cjk_ratio),
+        "noise_ratio": float(noise_ratio),
+    }
+
+
 def is_effective_burned_subtitle_text(text: str) -> bool:
-    return count_cjk_characters(text) >= constants.DEFAULT_BURNED_SUBTITLE_MIN_EFFECTIVE_CJK_CHARS
+    metrics = burned_subtitle_text_metrics(text)
+    return (
+        metrics["visible_char_count"] >= constants.DEFAULT_BURNED_SUBTITLE_MIN_VISIBLE_CHARS
+        and metrics["cjk_char_count"] >= 2
+        and metrics["cjk_ratio"] >= constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_RATIO
+        and metrics["noise_ratio"] <= constants.DEFAULT_BURNED_SUBTITLE_MAX_NOISE_RATIO
+    )
 
 
 def available_tesseract_languages() -> set[str]:
@@ -678,15 +711,45 @@ def available_tesseract_languages() -> set[str]:
 
 def choose_burned_subtitle_tesseract_languages() -> str | None:
     available = available_tesseract_languages()
-    cjk_languages = [language for language in constants.BURNED_SUBTITLE_TESSERACT_LANGS if language in available]
-    if not cjk_languages:
+    required_languages = [language for language in constants.BURNED_SUBTITLE_TESSERACT_LANGS if language in available]
+    if len(required_languages) != len(constants.BURNED_SUBTITLE_TESSERACT_LANGS):
         return None
     optional_languages = [
         language
         for language in constants.BURNED_SUBTITLE_OPTIONAL_TESSERACT_LANGS
         if language in available
     ]
-    return "+".join(cjk_languages + optional_languages)
+    return "+".join(required_languages + optional_languages)
+
+
+def burned_subtitle_policy(mode: str) -> dict[str, float | int]:
+    if mode == "auto":
+        return {
+            "sample_fps": constants.DEFAULT_BURNED_SUBTITLE_AUTO_SAMPLE_FPS,
+            "probe_min_hits": constants.DEFAULT_BURNED_SUBTITLE_AUTO_PROBE_MIN_HITS,
+            "probe_min_distinct_texts": constants.DEFAULT_BURNED_SUBTITLE_AUTO_PROBE_MIN_DISTINCT_TEXTS,
+            "quick_reject_seconds": constants.DEFAULT_BURNED_SUBTITLE_AUTO_QUICK_REJECT_SECONDS,
+            "quick_reject_events": constants.DEFAULT_BURNED_SUBTITLE_AUTO_QUICK_REJECT_EVENTS,
+            "early_gate_seconds": constants.DEFAULT_BURNED_SUBTITLE_AUTO_EARLY_GATE_SECONDS,
+            "early_gate_events": constants.DEFAULT_BURNED_SUBTITLE_AUTO_EARLY_GATE_EVENTS,
+            "min_nonempty_hits": constants.DEFAULT_BURNED_SUBTITLE_AUTO_MIN_NONEMPTY_HITS,
+            "min_hit_rate": constants.DEFAULT_BURNED_SUBTITLE_AUTO_MIN_HIT_RATE,
+            "min_cjk_chars": constants.DEFAULT_BURNED_SUBTITLE_AUTO_MIN_CJK_CHARS,
+            "min_cjk_ratio": constants.DEFAULT_BURNED_SUBTITLE_AUTO_MIN_CJK_RATIO,
+        }
+    return {
+        "sample_fps": constants.DEFAULT_BURNED_SUBTITLE_SAMPLE_FPS,
+        "probe_min_hits": constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_HITS,
+        "probe_min_distinct_texts": constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_DISTINCT_TEXTS,
+        "quick_reject_seconds": constants.DEFAULT_BURNED_SUBTITLE_QUICK_REJECT_SECONDS,
+        "quick_reject_events": constants.DEFAULT_BURNED_SUBTITLE_QUICK_REJECT_EVENTS,
+        "early_gate_seconds": constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_SECONDS,
+        "early_gate_events": constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_EVENTS,
+        "min_nonempty_hits": constants.DEFAULT_BURNED_SUBTITLE_MIN_NONEMPTY_HITS,
+        "min_hit_rate": constants.DEFAULT_BURNED_SUBTITLE_MIN_HIT_RATE,
+        "min_cjk_chars": constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_CHARS,
+        "min_cjk_ratio": constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_RATIO,
+    }
 
 
 def iter_subtitle_band_frames(
@@ -765,6 +828,8 @@ def iter_subtitle_band_frames(
         return_code = process.wait()
         if return_code not in {0, None}:
             message = stderr_text.strip() or f"ffmpeg exited with code {return_code}"
+            if "Broken pipe" in message:
+                return
             raise RuntimeError(f"Burned subtitle frame extraction failed: {message}")
 
 
@@ -776,7 +841,28 @@ def preprocess_burned_subtitle_image(image):
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     _, thresholded = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.resize(thresholded, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+    height = thresholded.shape[0]
+    if height < constants.DEFAULT_BURNED_SUBTITLE_UPSCALE_HEIGHT_THRESHOLD and height > 0:
+        upscale = min(
+            constants.DEFAULT_BURNED_SUBTITLE_MAX_UPSCALE,
+            constants.DEFAULT_BURNED_SUBTITLE_UPSCALE_HEIGHT_THRESHOLD / float(height),
+        )
+        if upscale > 1.0:
+            return cv2.resize(thresholded, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_LINEAR)
+    return thresholded
+
+
+def burned_subtitle_detection_roi(image):
+    if image is None:
+        return None
+    height, width = image.shape[:2]
+    if height <= 0 or width <= 0:
+        return image
+    roi_width = max(1, int(round(width * constants.DEFAULT_BURNED_SUBTITLE_DETECTION_WIDTH_RATIO)))
+    roi_height = max(1, int(round(height * constants.DEFAULT_BURNED_SUBTITLE_DETECTION_HEIGHT_RATIO)))
+    roi_x = max(0, int(round((width - roi_width) / 2.0)))
+    roi_y = max(0, height - roi_height)
+    return image[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width]
 
 
 def subtitle_band_diff(left, right) -> float:
@@ -801,10 +887,12 @@ def probe_burned_subtitles(
     metadata: dict[str, Any],
     *,
     tesseract_langs: str,
+    mode: str = "on",
 ) -> dict[str, Any]:
     hits = 0
     distinct_texts: list[str] = []
     sample_count = 0
+    policy = burned_subtitle_policy(mode)
     probe_fps = constants.DEFAULT_BURNED_SUBTITLE_PROBE_SAMPLES / constants.DEFAULT_BURNED_SUBTITLE_PROBE_DURATION_SECONDS
     for frame in iter_subtitle_band_frames(
         video_path,
@@ -823,8 +911,8 @@ def probe_burned_subtitles(
         if text not in distinct_texts:
             distinct_texts.append(text)
     passed = (
-        hits >= constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_HITS
-        and len(distinct_texts) >= constants.DEFAULT_BURNED_SUBTITLE_PROBE_MIN_DISTINCT_TEXTS
+        hits >= int(policy["probe_min_hits"])
+        and len(distinct_texts) >= int(policy["probe_min_distinct_texts"])
     )
     return {
         "passed": passed,
@@ -839,12 +927,18 @@ def burned_subtitle_quality_is_insufficient(
     ocr_event_count: int,
     nonempty_hits: int,
     cjk_char_count: int,
+    average_cjk_ratio: float = 0.0,
+    min_nonempty_hits: int = constants.DEFAULT_BURNED_SUBTITLE_MIN_NONEMPTY_HITS,
+    min_hit_rate: float = constants.DEFAULT_BURNED_SUBTITLE_MIN_HIT_RATE,
+    min_cjk_chars: int = constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_CHARS,
+    min_cjk_ratio: float = constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_RATIO,
 ) -> bool:
     hit_rate = 0.0 if ocr_event_count <= 0 else (nonempty_hits / ocr_event_count)
     return (
-        nonempty_hits < constants.DEFAULT_BURNED_SUBTITLE_MIN_NONEMPTY_HITS
-        or hit_rate < constants.DEFAULT_BURNED_SUBTITLE_MIN_HIT_RATE
-        or cjk_char_count < constants.DEFAULT_BURNED_SUBTITLE_MIN_CJK_CHARS
+        nonempty_hits < min_nonempty_hits
+        or hit_rate < min_hit_rate
+        or cjk_char_count < min_cjk_chars
+        or average_cjk_ratio < min_cjk_ratio
     )
 
 
@@ -853,17 +947,23 @@ def transcribe_burned_subtitles(
     metadata: dict[str, Any],
     *,
     tesseract_langs: str,
+    mode: str = "on",
 ) -> dict[str, Any]:
     segments: list[dict[str, Any]] = []
     current_text: str | None = None
     current_start: float | None = None
     current_end: float | None = None
     previous_image = None
-    sample_interval = 1.0 / constants.DEFAULT_BURNED_SUBTITLE_SAMPLE_FPS
+    policy = burned_subtitle_policy(mode)
+    sample_interval = 1.0 / float(policy["sample_fps"])
     ocr_event_count = 0
     nonempty_hits = 0
     cjk_char_count = 0
-    quality_gate_checked = False
+    visible_char_total = 0.0
+    cjk_ratio_total = 0.0
+    noise_ratio_total = 0.0
+    quick_reject_checked = False
+    early_gate_checked = False
 
     def close_segment() -> None:
         nonlocal current_text, current_start, current_end
@@ -879,38 +979,69 @@ def transcribe_burned_subtitles(
         current_start = None
         current_end = None
 
-    def should_fail_quality_gate(force: bool, timestamp_seconds: float) -> bool:
-        nonlocal quality_gate_checked
-        if quality_gate_checked:
+    def should_fail_quick_reject(force: bool, timestamp_seconds: float) -> bool:
+        nonlocal quick_reject_checked
+        if quick_reject_checked:
             return False
         if not force and (
-            timestamp_seconds < constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_SECONDS
-            and ocr_event_count < constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_EVENTS
+            timestamp_seconds < float(policy["quick_reject_seconds"])
+            and ocr_event_count < int(policy["quick_reject_events"])
         ):
             return False
-        quality_gate_checked = True
+        quick_reject_checked = True
+        average_visible_chars = 0.0 if ocr_event_count <= 0 else (visible_char_total / ocr_event_count)
+        average_cjk_ratio = 0.0 if ocr_event_count <= 0 else (cjk_ratio_total / ocr_event_count)
+        average_noise_ratio = 1.0 if ocr_event_count <= 0 else (noise_ratio_total / ocr_event_count)
+        return (
+            nonempty_hits < constants.DEFAULT_BURNED_SUBTITLE_QUICK_MIN_NONEMPTY_HITS
+            or average_visible_chars < constants.DEFAULT_BURNED_SUBTITLE_QUICK_MIN_VISIBLE_CHARS
+            or average_cjk_ratio < constants.DEFAULT_BURNED_SUBTITLE_QUICK_MIN_CJK_RATIO
+            or average_noise_ratio > constants.DEFAULT_BURNED_SUBTITLE_QUICK_MAX_NOISE_RATIO
+        )
+
+    def should_fail_quality_gate(force: bool, timestamp_seconds: float) -> bool:
+        nonlocal early_gate_checked
+        if early_gate_checked:
+            return False
+        if not force and (
+            timestamp_seconds < float(policy["early_gate_seconds"])
+            and ocr_event_count < int(policy["early_gate_events"])
+        ):
+            return False
+        early_gate_checked = True
+        average_cjk_ratio = 0.0 if ocr_event_count <= 0 else (cjk_ratio_total / ocr_event_count)
         return burned_subtitle_quality_is_insufficient(
             ocr_event_count=ocr_event_count,
             nonempty_hits=nonempty_hits,
             cjk_char_count=cjk_char_count,
+            average_cjk_ratio=average_cjk_ratio,
+            min_nonempty_hits=int(policy["min_nonempty_hits"]),
+            min_hit_rate=float(policy["min_hit_rate"]),
+            min_cjk_chars=int(policy["min_cjk_chars"]),
+            min_cjk_ratio=float(policy["min_cjk_ratio"]),
         )
 
     for frame in iter_subtitle_band_frames(
         video_path,
         metadata,
-        sample_fps=constants.DEFAULT_BURNED_SUBTITLE_SAMPLE_FPS,
+        sample_fps=float(policy["sample_fps"]),
     ):
         timestamp_seconds = float(frame["timestamp_seconds"])
         processed_image = preprocess_burned_subtitle_image(frame["image"])
+        detection_image = burned_subtitle_detection_roi(processed_image)
         if previous_image is not None:
-            difference = subtitle_band_diff(previous_image, processed_image)
+            difference = subtitle_band_diff(previous_image, detection_image)
             if difference < constants.DEFAULT_BURNED_SUBTITLE_DIFF_THRESHOLD:
                 if current_text:
                     current_end = round(timestamp_seconds + sample_interval, 3)
                 continue
-        previous_image = processed_image
+        previous_image = detection_image
         ocr_event_count += 1
         text = ocr_burned_subtitle_image(processed_image, lang=tesseract_langs)
+        metrics = burned_subtitle_text_metrics(text)
+        visible_char_total += metrics["visible_char_count"]
+        cjk_ratio_total += metrics["cjk_ratio"]
+        noise_ratio_total += metrics["noise_ratio"]
         effective_text = text if is_effective_burned_subtitle_text(text) else ""
         if effective_text:
             nonempty_hits += 1
@@ -925,18 +1056,30 @@ def transcribe_burned_subtitles(
                 current_start = timestamp_seconds
                 current_end = round(timestamp_seconds + sample_interval, 3)
 
+        if should_fail_quick_reject(False, timestamp_seconds):
+            return {
+                "segments": [],
+                "ocr_event_count": ocr_event_count,
+                "status": "fast_reject",
+            }
         if should_fail_quality_gate(False, timestamp_seconds):
             return {
                 "segments": [],
                 "ocr_event_count": ocr_event_count,
-                "status": "fallback_to_whisper",
+                "status": "fallback_to_whisper_quality",
             }
 
-    if should_fail_quality_gate(True, constants.DEFAULT_BURNED_SUBTITLE_EARLY_GATE_SECONDS):
+    if should_fail_quick_reject(True, float(policy["quick_reject_seconds"])):
         return {
             "segments": [],
             "ocr_event_count": ocr_event_count,
-            "status": "fallback_to_whisper",
+            "status": "fast_reject",
+        }
+    if should_fail_quality_gate(True, float(policy["early_gate_seconds"])):
+        return {
+            "segments": [],
+            "ocr_event_count": ocr_event_count,
+            "status": "fallback_to_whisper_quality",
         }
 
     close_segment()
@@ -957,6 +1100,7 @@ def run_burned_subtitles_stage(
     state = default_burned_subtitles_state(mode)
     if mode == "off":
         state["status"] = "disabled"
+        state["reason"] = "disabled"
         return None, state
     resolved_metadata = metadata
     if video_path is not None and (
@@ -968,28 +1112,33 @@ def run_burned_subtitles_stage(
             pass
     if video_path is None or not has_video_stream(resolved_metadata):
         state["status"] = "not_applicable"
+        state["reason"] = "not_applicable"
         return None, state
 
     state["attempted"] = True
     tesseract_langs = choose_burned_subtitle_tesseract_languages()
     if tesseract_langs is None:
         state["status"] = "missing_language_pack"
+        state["reason"] = "missing_language_pack"
         return None, state
 
     try:
         if mode == "auto":
-            probe = probe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs)
+            probe = probe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs, mode=mode)
             state["probe_passed"] = bool(probe["passed"])
+            state["probe_hits"] = int(probe["hits"])
             if not probe["passed"]:
                 state["status"] = "probe_rejected"
+                state["reason"] = "probe_rejected"
                 return None, state
         else:
             state["probe_passed"] = True
 
-        result = transcribe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs)
+        result = transcribe_burned_subtitles(video_path, resolved_metadata, tesseract_langs=tesseract_langs, mode=mode)
         state["ocr_event_count"] = int(result["ocr_event_count"])
         if result["status"] != "completed":
             state["status"] = str(result["status"])
+            state["reason"] = str(result["status"])
             return None, state
 
         transcript = transcript_from_segments(
@@ -999,9 +1148,11 @@ def run_burned_subtitles_stage(
         )
         write_transcript(paths, transcript)
         state["status"] = "completed"
+        state["reason"] = "completed"
         return transcript, state
     except Exception as exc:
         state["status"] = "failed"
+        state["reason"] = "failed"
         state["error"] = str(exc)
         return None, state
 

@@ -331,15 +331,32 @@ class OutputBundleTests(unittest.TestCase):
         self.assertEqual("subtitle", written["transcript"]["source"])
         self.assertEqual("Revenue is up.", written["transcript"]["full_text"])
         self.assertEqual(1, len(written["transcript"]["segments"]))
+        self.assertEqual(1, written["transcript"]["segment_count"])
+        self.assertEqual("text_track", written["transcript"]["provenance"]["extraction_kind"])
         self.assertEqual(1, len(written["visuals"]["slides"]))
         self.assertEqual("base64", written["visuals"]["slides"][0]["images"][0]["encoding"])
         self.assertEqual("slide", written["visuals"]["slides"][0]["effective_label"])
+        self.assertEqual(
+            "segment-0001",
+            written["visuals"]["slides"][0]["source_segment_ref"]["segment_id"],
+        )
+        self.assertEqual(
+            "heuristic_segment_promotion",
+            written["visuals"]["slides"][0]["provenance"]["selection_kind"],
+        )
         self.assertEqual("minimal", written["processing"]["artifact_mode"])
         self.assertEqual("auto", written["processing"]["transcript_mode"])
         self.assertEqual("auto", written["processing"]["ocr_mode"])
         self.assertEqual("auto", written["processing"]["burned_subtitles_mode"])
         self.assertEqual("not_attempted", written["processing"]["burned_subtitles_status"])
+        self.assertIsNone(written["processing"]["burned_subtitles_reason"])
+        self.assertEqual(0, written["processing"]["burned_subtitles_probe_hits"])
+        self.assertEqual(0, written["processing"]["burned_subtitles_ocr_events"])
         self.assertFalse(written["processing"]["gpt_enabled"])
+        self.assertEqual("direct_metadata_extract", written["provenance"]["metadata"]["extraction_kind"])
+        self.assertTrue(written["provenance"]["transcript"]["is_direct_text_track"])
+        self.assertEqual(1, written["provenance"]["visuals"]["slides"]["count"])
+        self.assertEqual(["segment-0001"], written["provenance"]["visuals"]["slides"]["segment_ids"])
         self.assertNotIn("gpt", written)
 
     def test_output_json_can_embed_gpt_payload(self) -> None:
@@ -479,6 +496,14 @@ class VisualPayloadTests(unittest.TestCase):
         self.assertEqual("base64", payload["slides"][0]["images"][0]["encoding"])
         self.assertEqual(1, len(payload["charts"][0]["images"]))
         self.assertIn("Chart OCR continued", payload["charts"][0]["ocr_text"])
+        self.assertEqual(
+            "segment-0001",
+            payload["slides"][0]["source_segment_ref"]["segment_id"],
+        )
+        self.assertEqual(
+            "heuristic_segment_promotion",
+            payload["charts"][0]["provenance"]["selection_kind"],
+        )
 
     def test_save_durable_visuals_exports_only_slides_and_charts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -572,6 +597,14 @@ class VisualPayloadTests(unittest.TestCase):
         self.assertEqual(1, len(payload["slides"]))
         self.assertEqual(1, len(payload["charts"]))
         self.assertEqual(payload, manifest)
+        self.assertEqual(
+            "segment-0001",
+            payload["slides"][0]["source_segment_ref"]["segment_id"],
+        )
+        self.assertEqual(
+            "heuristic_segment_promotion",
+            payload["charts"][0]["provenance"]["selection_kind"],
+        )
         self.assertTrue(slide_exists)
         self.assertTrue(chart_exists)
         self.assertFalse(uncertain_exists)

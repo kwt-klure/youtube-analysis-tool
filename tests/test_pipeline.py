@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from unittest import mock
 
+import numpy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -16,9 +18,12 @@ if str(SRC) not in sys.path:
 from youtube_analysis_tool.pipeline import (
     analyze_source,
     analysis_paths,
+    burned_subtitle_detection_roi,
     burned_subtitle_quality_is_insufficient,
+    burned_subtitle_text_metrics,
     cleanup_intermediate_artifacts,
     choose_subtitle_file,
+    choose_burned_subtitle_tesseract_languages,
     choose_subtitle_track_from_metadata,
     default_ocr_state,
     default_output_dir_for_source,
@@ -30,10 +35,13 @@ from youtube_analysis_tool.pipeline import (
     parse_subtitle_file,
     preferred_subtitle_languages,
     parse_srt_or_vtt,
+    preprocess_burned_subtitle_image,
     run_ocr_stage,
+    transcribe_burned_subtitles,
     transcript_from_subtitles,
     transcript_strategy_auto,
     transcript_from_segments,
+    is_effective_burned_subtitle_text,
 )
 
 
@@ -492,9 +500,11 @@ class TranscriptPolicyTests(unittest.TestCase):
             }
             burned_state = {
                 "mode": "auto",
-                "status": "fallback_to_whisper",
+                "status": "fallback_to_whisper_quality",
                 "attempted": True,
                 "probe_passed": True,
+                "reason": "fallback_to_whisper_quality",
+                "probe_hits": 3,
                 "ocr_event_count": 5,
                 "error": None,
             }
@@ -579,6 +589,7 @@ class TranscriptPolicyTests(unittest.TestCase):
                 ocr_event_count=10,
                 nonempty_hits=3,
                 cjk_char_count=80,
+                average_cjk_ratio=0.45,
             )
         )
         self.assertFalse(
@@ -586,8 +597,154 @@ class TranscriptPolicyTests(unittest.TestCase):
                 ocr_event_count=12,
                 nonempty_hits=8,
                 cjk_char_count=140,
+                average_cjk_ratio=0.6,
             )
         )
+
+    def test_burned_subtitle_text_metrics_penalize_garbage_cjk_mix(self) -> None:
+        metrics = burned_subtitle_text_metrics("中A!@#")
+
+        self.assertEqual(5.0, metrics["visible_char_count"])
+        self.assertEqual(1.0, metrics["cjk_char_count"])
+        self.assertLess(metrics["cjk_ratio"], 0.45)
+        self.assertGreater(metrics["noise_ratio"], 0.35)
+        self.assertFalse(is_effective_burned_subtitle_text("中A!@#"))
+
+    def test_choose_burned_subtitle_languages_requires_both_chinese_packs(self) -> None:
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.available_tesseract_languages",
+            return_value={"chi_sim", "eng"},
+        ):
+            self.assertIsNone(choose_burned_subtitle_tesseract_languages())
+
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.available_tesseract_languages",
+            return_value={"chi_sim", "chi_tra", "eng"},
+        ):
+            self.assertEqual("chi_sim+chi_tra+eng", choose_burned_subtitle_tesseract_languages())
+
+    def test_detection_roi_is_smaller_than_full_subtitle_band(self) -> None:
+        image = numpy.zeros((160, 900), dtype=numpy.uint8)
+
+        roi = burned_subtitle_detection_roi(image)
+
+        self.assertEqual((96, 630), roi.shape)
+
+    def test_preprocess_burned_subtitle_image_only_upscales_small_inputs(self) -> None:
+        small = numpy.zeros((120, 240), dtype=numpy.uint8)
+        large = numpy.zeros((220, 240), dtype=numpy.uint8)
+
+        small_processed = preprocess_burned_subtitle_image(small)
+        large_processed = preprocess_burned_subtitle_image(large)
+
+        self.assertEqual((180, 360), small_processed.shape)
+        self.assertEqual((220, 240), large_processed.shape)
+
+    def test_transcribe_burned_subtitles_fast_rejects_bad_shorts_case(self) -> None:
+        metadata = {"streams": [{"codec_type": "video", "width": 1080, "height": 1920}]}
+        frames = [
+            {"timestamp_seconds": 0.0, "image": "frame-0"},
+            {"timestamp_seconds": 1.0, "image": "frame-1"},
+            {"timestamp_seconds": 2.0, "image": "frame-2"},
+            {"timestamp_seconds": 3.0, "image": "frame-3"},
+        ]
+        captured_sample_fps: list[float] = []
+
+        def fake_iter(_video_path, _metadata, *, sample_fps, duration_limit=None):
+            del duration_limit
+            captured_sample_fps.append(sample_fps)
+            return iter(frames)
+
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.iter_subtitle_band_frames",
+            side_effect=fake_iter,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.preprocess_burned_subtitle_image",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.burned_subtitle_detection_roi",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.subtitle_band_diff",
+            return_value=1.0,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.ocr_burned_subtitle_image",
+            side_effect=["亂A!", "", "中-", ""],
+        ):
+            result = transcribe_burned_subtitles(Path("/tmp/demo.mp4"), metadata, tesseract_langs="chi_sim+chi_tra+eng")
+
+        self.assertEqual([1.0], captured_sample_fps)
+        self.assertEqual("fast_reject", result["status"])
+        self.assertEqual(4, result["ocr_event_count"])
+
+    def test_transcribe_burned_subtitles_auto_mode_is_more_conservative(self) -> None:
+        metadata = {"streams": [{"codec_type": "video", "width": 1080, "height": 1920}]}
+        frames = [
+            {"timestamp_seconds": 0.0, "image": "frame-0"},
+            {"timestamp_seconds": 2.0, "image": "frame-1"},
+        ]
+        captured_sample_fps: list[float] = []
+
+        def fake_iter(_video_path, _metadata, *, sample_fps, duration_limit=None):
+            del duration_limit
+            captured_sample_fps.append(sample_fps)
+            return iter(frames)
+
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.iter_subtitle_band_frames",
+            side_effect=fake_iter,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.preprocess_burned_subtitle_image",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.burned_subtitle_detection_roi",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.subtitle_band_diff",
+            return_value=1.0,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.ocr_burned_subtitle_image",
+            side_effect=["亂A!", ""],
+        ):
+            result = transcribe_burned_subtitles(
+                Path("/tmp/demo.mp4"),
+                metadata,
+                tesseract_langs="chi_sim+chi_tra+eng",
+                mode="auto",
+            )
+
+        self.assertEqual([0.5], captured_sample_fps)
+        self.assertEqual("fast_reject", result["status"])
+        self.assertEqual(2, result["ocr_event_count"])
+
+    def test_transcribe_burned_subtitles_can_fall_back_at_early_gate(self) -> None:
+        metadata = {"streams": [{"codec_type": "video", "width": 1080, "height": 1920}]}
+        frames = [
+            {"timestamp_seconds": float(index), "image": f"frame-{index}"}
+            for index in range(12)
+        ]
+        ocr_texts = ["这是字幕内容"] * 4 + ["", "", "", "", "", "", "", ""]
+
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.iter_subtitle_band_frames",
+            return_value=iter(frames),
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.preprocess_burned_subtitle_image",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.burned_subtitle_detection_roi",
+            side_effect=lambda image: image,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.subtitle_band_diff",
+            return_value=1.0,
+        ), mock.patch(
+            "youtube_analysis_tool.pipeline.ocr_burned_subtitle_image",
+            side_effect=ocr_texts,
+        ):
+            result = transcribe_burned_subtitles(Path("/tmp/demo.mp4"), metadata, tesseract_langs="chi_sim+chi_tra+eng")
+
+        self.assertEqual("fallback_to_whisper_quality", result["status"])
+        self.assertEqual(12, result["ocr_event_count"])
 
 
 class OcrModeTests(unittest.TestCase):

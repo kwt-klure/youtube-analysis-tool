@@ -45,6 +45,29 @@ def combine_ocr_text(frame_records: list[dict[str, Any]]) -> str:
     return "\n".join(chunks).strip()
 
 
+def source_segment_ref(*, segment_id: str, bucket: str) -> dict[str, Any]:
+    return {
+        "segment_id": segment_id,
+        "artifact_path": "triage/segments.json",
+        "visual_bucket": bucket,
+    }
+
+
+def visual_entry_provenance(*, bucket: str) -> dict[str, Any]:
+    return {
+        "selection_kind": "heuristic_segment_promotion",
+        "effective_label_source": "routing_label_after_review_or_heuristic_fallback",
+        "timing_source": "triage_segment",
+        "ocr_text_source": "frame_ocr_aggregate",
+        "transcript_excerpt_source": "transcript_window_text",
+        "image_source": "representative_or_first_available_frame",
+        "quality_notes": [
+            "effective label is a routing/debug label, not semantic understanding",
+            f"visual is grouped into canonical {canonical_effective_label(bucket)} bucket for downstream AI consumption",
+        ],
+    }
+
+
 def choose_primary_frame_id(segment: dict[str, Any], frame_records: list[dict[str, Any]]) -> str | None:
     if not frame_records:
         return None
@@ -110,6 +133,8 @@ def build_embedded_visual_entry(
         "transcript_excerpt": transcript_excerpt(segment.get("transcript_window", {}).get("text", "")),
         "images": [image],
         "primary_image_index": 0,
+        "source_segment_ref": source_segment_ref(segment_id=segment["segment_id"], bucket=bucket),
+        "provenance": visual_entry_provenance(bucket=bucket),
     }
 
 
@@ -188,11 +213,8 @@ def build_debug_visual_entry(
         "primary_image_path": primary_image_path,
         "frame_count": len(image_paths),
         "transcript_excerpt": transcript_excerpt(segment.get("transcript_window", {}).get("text", "")),
-        "source_segment_ref": {
-            "segment_id": segment["segment_id"],
-            "artifact_path": "triage/segments.json",
-            "visual_bucket": bucket,
-        },
+        "source_segment_ref": source_segment_ref(segment_id=segment["segment_id"], bucket=bucket),
+        "provenance": visual_entry_provenance(bucket=bucket),
     }
 
 

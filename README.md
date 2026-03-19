@@ -7,6 +7,22 @@ escalate to GPT only when that extra semantic layer is actually worth paying
 for. A normal run is designed for downstream AI consumption, not for browsing a
 pile of side artifacts by hand.
 
+## AI-First, Not Human-First
+
+The default output is intentionally shaped for another model to read, not for a
+person to casually skim in a text editor.
+
+That means:
+
+- one canonical `output.json` instead of a pile of sibling artifacts
+- full transcript inline, because downstream AI benefits from direct context
+- retained visuals embedded inline, because AI should not have to chase image paths
+- explicit provenance and source labeling, so downstream readers know what came
+  from subtitles, Whisper, OCR, or heuristic routing
+
+It also means `output.json` is not optimized to feel pleasant for direct human
+reading. It is a machine-facing bundle first.
+
 ## Status
 
 The current v1 core path is validated and intentionally stable.
@@ -58,6 +74,10 @@ Running `youtube-analyze --source ...` with no extra flags:
 self-contained and does not depend on sibling JSON files, image folders, or
 report files.
 
+If you open it yourself, it may feel dense or even ugly. That is expected. The
+design target is "easy for downstream AI to ingest," not "pleasant for humans
+to browse raw."
+
 ## Why This Exists
 
 Many video-analysis tools follow a costly pattern:
@@ -99,6 +119,7 @@ Top-level shape:
     "charts": []
   },
   "processing": {},
+  "provenance": {},
   "errors": [],
   "gpt": {}
 }
@@ -110,6 +131,8 @@ Top-level shape:
 - `language`
 - `full_text`
 - `segments`
+- `segment_count`
+- `provenance`
 
 `visuals` contains only the AI-facing buckets:
 
@@ -128,10 +151,16 @@ Each retained visual item includes:
 - `transcript_excerpt`
 - `images`
 - `primary_image_index`
+- `source_segment_ref`
+- `provenance`
 
 In minimal mode, `images` normally contains exactly one Base64-embedded primary
 image. The full OCR text stays inline because it is usually more useful to AI
 than extra near-duplicate frames.
+
+`provenance` exists because not all sources are equally trustworthy. Manual
+subtitles, YouTube auto captions, burned subtitle OCR, and Whisper output should
+not be treated as if they have the same confidence profile.
 
 ## Transcript And OCR Behavior
 
@@ -139,8 +168,9 @@ Transcript resolution is subtitle-first:
 
 1. manual subtitles
 2. YouTube automatic captions
-3. local Whisper
-4. OpenAI transcription fallback
+3. burned subtitle OCR
+4. local Whisper
+5. OpenAI transcription fallback
 
 If any usable subtitle track exists, the tool uses it directly even when the
 language is not in the preferred list. Language preference still affects which
@@ -168,6 +198,10 @@ OCR is always local. The default is `--ocr auto`, which means:
 - try OCR when keyframes exist
 - keep going if OCR fails
 - record the degraded state in `output.json`
+
+Burned subtitle OCR is also local, but it is intentionally conservative. In
+`auto` mode it is allowed to fail fast and fall back to Whisper. If it succeeds,
+that is a bonus path, not the primary contract.
 
 ## Artifact Modes
 
