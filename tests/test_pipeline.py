@@ -26,6 +26,7 @@ from youtube_analysis_tool.pipeline import (
     duration_seconds,
     extract_interval_keyframes,
     parse_args,
+    parse_subtitle_file,
     preferred_subtitle_languages,
     parse_srt_or_vtt,
     run_ocr_stage,
@@ -52,6 +53,26 @@ class SubtitleParsingTests(unittest.TestCase):
         self.assertEqual(2, len(segments))
         self.assertEqual("Hello world", segments[0]["text"])
         self.assertEqual("Second line", segments[1]["text"])
+
+    def test_parse_json3_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subtitle_path = Path(tmpdir) / "sample.ja.auto.json3"
+            subtitle_path.write_text(
+                (
+                    '{"events": ['
+                    '{"tStartMs": 0, "dDurationMs": 1200, "segs": [{"utf8": "Hello "}, {"utf8": "world"}]},'
+                    '{"tStartMs": 1500, "dDurationMs": 500, "segs": [{"utf8": "Again"}]}'
+                    "]} "
+                ),
+                encoding="utf-8",
+            )
+            segments = parse_subtitle_file(subtitle_path)
+
+        self.assertEqual(2, len(segments))
+        self.assertEqual("Hello world", segments[0]["text"])
+        self.assertEqual(0.0, segments[0]["start"])
+        self.assertEqual(1.2, segments[0]["end"])
+        self.assertEqual("Again", segments[1]["text"])
 
     def test_transcript_from_manual_subtitles_uses_manual_source_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -94,6 +115,15 @@ class SubtitleParsingTests(unittest.TestCase):
 
         self.assertIsNotNone(choice)
         self.assertEqual("video.ja.manual.vtt", choice.name)
+
+    def test_choose_subtitle_file_accepts_json3_when_no_vtt_or_srt_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "video.ja.auto.json3").write_text("{}", encoding="utf-8")
+            choice = choose_subtitle_file(root)
+
+        self.assertIsNotNone(choice)
+        self.assertEqual("video.ja.auto.json3", choice.name)
 
     def test_transcript_from_segments_keeps_text_and_count(self) -> None:
         transcript = transcript_from_segments(
@@ -446,6 +476,24 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertEqual("subtitles", bucket_name)
         self.assertEqual("zh-TW", language)
         self.assertEqual("vtt", item["ext"])
+
+    def test_choose_subtitle_track_from_metadata_accepts_auto_json3_when_needed(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "automatic_captions": {
+                    "ja": [
+                        {"ext": "srv3", "url": "https://example.com/ja.srv3"},
+                        {"ext": "json3", "url": "https://example.com/ja.json3"},
+                    ]
+                }
+            }
+        )
+
+        self.assertIsNotNone(selection)
+        bucket_name, language, item = selection
+        self.assertEqual("automatic_captions", bucket_name)
+        self.assertEqual("ja", language)
+        self.assertEqual("json3", item["ext"])
 
     def test_download_youtube_subtitles_uses_narrow_official_subtitle_policy(self) -> None:
         captured = {}

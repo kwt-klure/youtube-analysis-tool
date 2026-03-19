@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.request import urlopen
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
@@ -307,7 +309,7 @@ def subtitle_language_rank(language: str | None) -> int:
 
 
 def subtitle_ext_rank(ext: str | None) -> int:
-    preferred = ("vtt", "srt", "ttml", "srv3", "srv2", "srv1", "json3")
+    preferred = ("vtt", "srt", "json3", "ttml", "srv3", "srv2", "srv1")
     normalized = (ext or "").lower()
     try:
         return preferred.index(normalized)
@@ -334,7 +336,7 @@ def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
         path
         for path in subtitles_dir.glob("*")
         if path.is_file()
-        and path.suffix.lower() in {".vtt", ".srt"}
+        and path.suffix.lower() in {".vtt", ".srt", ".json3", ".ttml", ".srv3", ".srv2", ".srv1"}
         and "live_chat" not in path.name.lower()
     ]
     if not candidates:
@@ -344,12 +346,13 @@ def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
 
 def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
     candidates: list[tuple[int, int, int, str, str, dict[str, Any]]] = []
+    allowed_extensions = {"vtt", "srt", "json3", "ttml", "srv3", "srv2", "srv1"}
     for bucket_name in ("subtitles", "automatic_captions"):
         bucket = metadata.get(bucket_name) or {}
         for language, items in bucket.items():
             for item in items:
                 ext = str(item.get("ext", "")).lower()
-                if ext not in {"vtt", "srt"}:
+                if ext not in allowed_extensions:
                     continue
                 candidates.append(
                     (
@@ -435,6 +438,79 @@ def parse_srt_or_vtt(path: Path) -> list[dict[str, Any]]:
     return segments
 
 
+def parse_json3(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    segments: list[dict[str, Any]] = []
+    for event in payload.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        segs = event.get("segs") or []
+        text = "".join(str(part.get("utf8", "")) for part in segs if isinstance(part, dict))
+        text = clean_caption_text([html.unescape(text)])
+        if not text:
+            continue
+        start_ms = event.get("tStartMs")
+        duration_ms = event.get("dDurationMs")
+        if start_ms is None or duration_ms is None:
+            continue
+        start = round(float(start_ms) / 1000.0, 3)
+        end = round(start + (float(duration_ms) / 1000.0), 3)
+        segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+def parse_xml_timestamp(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    token = str(raw).strip()
+    if not token:
+        return None
+    if token.endswith("ms"):
+        return float(token[:-2]) / 1000.0
+    if token.endswith("s"):
+        return float(token[:-1])
+    if ":" in token:
+        return parse_timestamp(token)
+    return float(token)
+
+
+def parse_xml_subtitles(path: Path) -> list[dict[str, Any]]:
+    root = ElementTree.fromstring(path.read_text(encoding="utf-8", errors="ignore"))
+    segments: list[dict[str, Any]] = []
+    for element in root.iter():
+        tag = element.tag.rsplit("}", 1)[-1].lower()
+        if tag not in {"text", "p"}:
+            continue
+        raw_text = "".join(element.itertext())
+        text = clean_caption_text([html.unescape(raw_text)])
+        if not text:
+            continue
+        start = parse_xml_timestamp(
+            element.attrib.get("start") or element.attrib.get("begin") or element.attrib.get("t")
+        )
+        end = parse_xml_timestamp(element.attrib.get("end"))
+        dur = parse_xml_timestamp(element.attrib.get("dur") or element.attrib.get("d"))
+        if start is None:
+            continue
+        if end is None:
+            if dur is None:
+                continue
+            end = start + dur
+        segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+    return segments
+
+
+def parse_subtitle_file(path: Path) -> list[dict[str, Any]]:
+    ext = path.suffix.lower()
+    if ext in {".vtt", ".srt"}:
+        return parse_srt_or_vtt(path)
+    if ext == ".json3":
+        return parse_json3(path)
+    if ext in {".ttml", ".srv3", ".srv2", ".srv1"}:
+        return parse_xml_subtitles(path)
+    raise ValueError(f"Unsupported subtitle format: {path.suffix}")
+
+
 def transcript_from_segments(
     segments: list[dict[str, Any]],
     *,
@@ -459,7 +535,7 @@ def write_transcript(paths: AnalysisPaths, transcript: dict[str, Any]) -> None:
 
 
 def transcript_from_subtitles(subtitle_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
-    segments = parse_srt_or_vtt(subtitle_path)
+    segments = parse_subtitle_file(subtitle_path)
     language = detect_language_from_filename(subtitle_path)
     transcript = transcript_from_segments(
         segments,
