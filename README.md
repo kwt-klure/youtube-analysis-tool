@@ -90,7 +90,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "2.x",
+  "output_version": "1.0",
   "source": {},
   "metadata": {},
   "transcript": {},
