@@ -331,6 +331,13 @@ def subtitle_bucket_marker(bucket_name: str | None) -> str:
     return "manual"
 
 
+def subtitle_translation_rank(bucket_name: str | None, item: dict[str, Any]) -> int:
+    if bucket_name != "automatic_captions":
+        return 0
+    url = str(item.get("url") or "")
+    return 1 if "tlang=" in url else 0
+
+
 def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
     candidates = [
         path
@@ -345,7 +352,7 @@ def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
 
 
 def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
-    candidates: list[tuple[int, int, int, str, str, dict[str, Any]]] = []
+    candidates: list[tuple[int, int, int, int, str, str, dict[str, Any]]] = []
     allowed_extensions = {"vtt", "srt", "json3", "ttml", "srv3", "srv2", "srv1"}
     for bucket_name in ("subtitles", "automatic_captions"):
         bucket = metadata.get(bucket_name) or {}
@@ -357,6 +364,7 @@ def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, 
                 candidates.append(
                     (
                         subtitle_bucket_rank(bucket_name),
+                        subtitle_translation_rank(bucket_name, item),
                         subtitle_language_rank(language),
                         subtitle_ext_rank(ext),
                         bucket_name,
@@ -366,7 +374,7 @@ def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, 
                 )
     if not candidates:
         return None
-    _, _, _, bucket_name, language, item = sorted(candidates, key=lambda row: row[:3])[0]
+    _, _, _, _, bucket_name, language, item = sorted(candidates, key=lambda row: row[:4])[0]
     return bucket_name, language, item
 
 
@@ -374,15 +382,70 @@ def preferred_subtitle_languages() -> list[str]:
     return [language for language in constants.SUBTITLE_LANGUAGE_PREFERENCE]
 
 
-def download_subtitle_from_metadata(metadata: dict[str, Any], paths: AnalysisPaths) -> Path | None:
+def download_selected_subtitle_track(
+    source_url: str,
+    paths: AnalysisPaths,
+    *,
+    bucket_name: str,
+    language: str,
+    ext: str,
+) -> Path | None:
+    YoutubeDL = load_yt_dlp()
+    marker = subtitle_bucket_marker(bucket_name)
+    before = {path.name for path in paths.subtitles_dir.glob("*")}
+    subtitle_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "writesubtitles": bucket_name == "subtitles",
+        "writeautomaticsub": bucket_name == "automatic_captions",
+        "subtitleslangs": [language],
+        "subtitlesformat": ext,
+        "outtmpl": {
+            "subtitle": str(paths.subtitles_dir / f"%(id)s.%(language)s.{marker}.%(ext)s"),
+        },
+    }
+    with YoutubeDL(subtitle_opts) as ydl:
+        ydl.extract_info(source_url, download=True)
+    after = {
+        path.name
+        for path in paths.subtitles_dir.glob("*")
+        if path.is_file() and "live_chat" not in path.name.lower()
+    }
+    new_files = sorted(after - before)
+    if new_files:
+        return paths.subtitles_dir / new_files[0]
+    return choose_subtitle_file(paths.subtitles_dir)
+
+
+def download_subtitle_from_metadata(
+    metadata: dict[str, Any],
+    paths: AnalysisPaths,
+    *,
+    source_url: str | None = None,
+) -> Path | None:
     selection = choose_subtitle_track_from_metadata(metadata)
     if selection is None:
         return None
     bucket_name, language, item = selection
+    ext = str(item.get("ext", "vtt")).lower()
+    if source_url is not None:
+        try:
+            result = download_selected_subtitle_track(
+                source_url,
+                paths,
+                bucket_name=bucket_name,
+                language=language,
+                ext=ext,
+            )
+            if result is not None:
+                return result
+        except Exception:
+            pass
     url = item.get("url")
     if not url:
         return None
-    ext = str(item.get("ext", "vtt")).lower()
     marker = subtitle_bucket_marker(bucket_name)
     subtitle_path = paths.subtitles_dir / f"{metadata.get('id', 'video')}.{language}.{marker}.{ext}"
     with urlopen(str(url)) as response:
@@ -884,12 +947,12 @@ def download_youtube_media(
         # Whisper after the video is downloaded.
         if metadata_hint is not None:
             try:
-                download_subtitle_from_metadata(metadata_hint, paths)
+                download_subtitle_from_metadata(metadata_hint, paths, source_url=url)
             except Exception:
                 pass
     if choose_subtitle_file(paths.subtitles_dir) is None and metadata_hint is not None:
         try:
-            download_subtitle_from_metadata(metadata_hint, paths)
+            download_subtitle_from_metadata(metadata_hint, paths, source_url=url)
         except Exception:
             pass
     video_opts = {
@@ -903,6 +966,11 @@ def download_youtube_media(
     }
     with YoutubeDL(video_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+    if choose_subtitle_file(paths.subtitles_dir) is None:
+        try:
+            download_subtitle_from_metadata(info, paths, source_url=url)
+        except Exception:
+            pass
     write_json(paths.metadata_path, info)
     candidates = [
         path
