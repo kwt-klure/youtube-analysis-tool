@@ -90,7 +90,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0",
+  "output_version": "1.0.1",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -135,11 +135,21 @@ than extra near-duplicate frames.
 
 ## Transcript And OCR Behavior
 
-Default transcript strategy is:
+Transcript resolution is subtitle-first:
 
-1. subtitles
-2. local Whisper
-3. OpenAI transcription fallback
+1. manual subtitles
+2. YouTube automatic captions
+3. local Whisper
+4. OpenAI transcription fallback
+
+If any usable subtitle track exists, the tool uses it directly even when the
+language is not in the preferred list. Language preference still affects which
+subtitle gets picked first, but any available subtitle beats Whisper.
+
+When transcript resolution succeeds from subtitles, the tool skips audio
+extraction for transcript work. This optimization does not reduce the visual
+pipeline: video download, keyframe extraction, OCR, triage, and retained
+visuals still run as usual.
 
 If you want a fully local run with no OpenAI usage at all, use:
 

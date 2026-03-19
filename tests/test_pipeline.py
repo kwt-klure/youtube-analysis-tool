@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from youtube_analysis_tool.pipeline import (
+    analyze_source,
     analysis_paths,
     cleanup_intermediate_artifacts,
     choose_subtitle_file,
@@ -28,6 +29,7 @@ from youtube_analysis_tool.pipeline import (
     preferred_subtitle_languages,
     parse_srt_or_vtt,
     run_ocr_stage,
+    transcript_from_subtitles,
     transcript_strategy_auto,
     transcript_from_segments,
 )
@@ -51,6 +53,28 @@ class SubtitleParsingTests(unittest.TestCase):
         self.assertEqual("Hello world", segments[0]["text"])
         self.assertEqual("Second line", segments[1]["text"])
 
+    def test_transcript_from_manual_subtitles_uses_manual_source_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            subtitle_path = paths.subtitles_dir / "video.en.manual.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n", encoding="utf-8")
+            transcript = transcript_from_subtitles(subtitle_path, paths)
+
+        self.assertEqual("subtitle_manual", transcript["source"])
+        self.assertEqual("en", transcript["language"])
+
+    def test_transcript_from_auto_subtitles_uses_auto_source_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            subtitle_path = paths.subtitles_dir / "video.ja.auto.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n", encoding="utf-8")
+            transcript = transcript_from_subtitles(subtitle_path, paths)
+
+        self.assertEqual("subtitle_auto", transcript["source"])
+        self.assertEqual("ja", transcript["language"])
+
     def test_choose_subtitle_file_prefers_chinese_then_english(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -60,6 +84,16 @@ class SubtitleParsingTests(unittest.TestCase):
 
         self.assertIsNotNone(choice)
         self.assertEqual("video.zh-tw.vtt", choice.name)
+
+    def test_choose_subtitle_file_prefers_manual_before_auto_for_same_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "video.ja.auto.vtt").write_text("", encoding="utf-8")
+            (root / "video.ja.manual.vtt").write_text("", encoding="utf-8")
+            choice = choose_subtitle_file(root)
+
+        self.assertIsNotNone(choice)
+        self.assertEqual("video.ja.manual.vtt", choice.name)
 
     def test_transcript_from_segments_keeps_text_and_count(self) -> None:
         transcript = transcript_from_segments(
@@ -186,6 +220,153 @@ class TranscriptPolicyTests(unittest.TestCase):
         whisper_mock.assert_called_once()
         openai_mock.assert_called_once()
 
+    def test_whisper_mode_still_prefers_subtitles_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.en.manual.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_manual", "language": "en", "text": "subtitle text", "segments": []}
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ) as subtitle_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper"
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ) as empty_stage_mock:
+                result = analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="whisper",
+                    cleanup_intermediates=False,
+                )
+
+        self.assertEqual(output_root, result)
+        subtitle_mock.assert_called_once()
+        whisper_mock.assert_not_called()
+        empty_stage_mock.assert_called_once()
+
+    def test_whisper_mode_with_subtitles_skips_audio_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.en.auto.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_auto", "language": "en", "text": "subtitle text", "segments": []}
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper"
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="whisper",
+                    cleanup_intermediates=False,
+                )
+
+        extract_audio_mock.assert_not_called()
+        whisper_mock.assert_not_called()
+
+    def test_api_mode_still_prefers_subtitles_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.en.auto.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_auto", "language": "en", "text": "subtitle text", "segments": []}
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ) as subtitle_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+            ) as openai_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                result = analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="api",
+                    cleanup_intermediates=False,
+                )
+
+        self.assertEqual(output_root, result)
+        subtitle_mock.assert_called_once()
+        extract_audio_mock.assert_not_called()
+        openai_mock.assert_not_called()
+
+    def test_subtitles_mode_accepts_auto_captions_without_audio_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.ja.auto.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_auto", "language": "ja", "text": "subtitle text", "segments": []}
+
+            with mock.patch("youtube_analysis_tool.pipeline.materialize_local_input", return_value=({}, source_path)), mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ) as subtitle_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                result = analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="subtitles",
+                    cleanup_intermediates=False,
+                )
+
+        self.assertEqual(output_root, result)
+        subtitle_mock.assert_called_once()
+        extract_audio_mock.assert_not_called()
+
 
 class OcrModeTests(unittest.TestCase):
     def test_default_ocr_state_uses_requested_mode(self) -> None:
@@ -226,7 +407,28 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
     def test_preferred_subtitle_languages_follow_constants(self) -> None:
         self.assertEqual("zh-tw", preferred_subtitle_languages()[0])
 
-    def test_choose_subtitle_track_from_metadata_prefers_language_and_vtt(self) -> None:
+    def test_choose_subtitle_track_from_metadata_prefers_manual_before_auto(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "subtitles": {
+                    "en": [{"ext": "srt", "url": "https://example.com/en.srt"}],
+                },
+                "automatic_captions": {
+                    "zh-TW": [
+                        {"ext": "json3", "url": "https://example.com/zh.json3"},
+                        {"ext": "vtt", "url": "https://example.com/zh.vtt"},
+                    ]
+                }
+            }
+        )
+
+        self.assertIsNotNone(selection)
+        bucket_name, language, item = selection
+        self.assertEqual("subtitles", bucket_name)
+        self.assertEqual("en", language)
+        self.assertEqual("srt", item["ext"])
+
+    def test_choose_subtitle_track_from_metadata_prefers_language_and_vtt_within_bucket(self) -> None:
         selection = choose_subtitle_track_from_metadata(
             {
                 "subtitles": {
@@ -240,7 +442,8 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(selection)
-        language, item = selection
+        bucket_name, language, item = selection
+        self.assertEqual("subtitles", bucket_name)
         self.assertEqual("zh-TW", language)
         self.assertEqual("vtt", item["ext"])
 
@@ -270,6 +473,7 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertTrue(opts["writesubtitles"])
         self.assertFalse(opts["writeautomaticsub"])
         self.assertEqual(preferred_subtitle_languages(), opts["subtitleslangs"])
+        self.assertIn(".manual.", opts["outtmpl"]["subtitle"])
 
     def test_download_youtube_media_continues_when_subtitle_download_fails(self) -> None:
         class FakeYoutubeDL:
@@ -325,7 +529,7 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
                 )
             self.assertEqual("demo-video", info["id"])
             self.assertTrue(video_path.exists())
-            subtitle_path = paths.subtitles_dir / "demo-video.zh-TW.vtt"
+            subtitle_path = paths.subtitles_dir / "demo-video.zh-TW.manual.vtt"
             self.assertTrue(subtitle_path.exists())
 
 

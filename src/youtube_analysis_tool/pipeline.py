@@ -274,16 +274,28 @@ def detect_language_from_filename(path: Path) -> str | None:
     suffixes = path.name.split(".")
     if len(suffixes) < 3:
         return None
+    if len(suffixes) >= 4 and suffixes[-2].lower() in {"manual", "auto"}:
+        return suffixes[-3].lower()
     return suffixes[-2].lower()
 
 
-def subtitle_rank(path: Path) -> tuple[int, str]:
-    language = detect_language_from_filename(path) or "zz"
-    try:
-        rank = constants.SUBTITLE_LANGUAGE_PREFERENCE.index(language)
-    except ValueError:
-        rank = len(constants.SUBTITLE_LANGUAGE_PREFERENCE)
-    return (rank, language)
+def detect_subtitle_source_from_filename(path: Path) -> str:
+    suffixes = path.name.split(".")
+    if len(suffixes) >= 4 and suffixes[-2].lower() == "auto":
+        return "subtitle_auto"
+    return "subtitle_manual"
+
+
+def subtitle_rank(path: Path) -> tuple[int, int, int, str]:
+    language = detect_language_from_filename(path)
+    source_kind = detect_subtitle_source_from_filename(path)
+    ext = path.suffix.lower().lstrip(".")
+    return (
+        0 if source_kind == "subtitle_manual" else 1,
+        subtitle_language_rank(language),
+        subtitle_ext_rank(ext),
+        path.name,
+    )
 
 
 def subtitle_language_rank(language: str | None) -> int:
@@ -303,6 +315,20 @@ def subtitle_ext_rank(ext: str | None) -> int:
         return len(preferred)
 
 
+def subtitle_bucket_rank(bucket_name: str | None) -> int:
+    if bucket_name == "subtitles":
+        return 0
+    if bucket_name == "automatic_captions":
+        return 1
+    return 2
+
+
+def subtitle_bucket_marker(bucket_name: str | None) -> str:
+    if bucket_name == "automatic_captions":
+        return "auto"
+    return "manual"
+
+
 def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
     candidates = [
         path
@@ -316,8 +342,8 @@ def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
     return sorted(candidates, key=subtitle_rank)[0]
 
 
-def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
-    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
+    candidates: list[tuple[int, int, int, str, str, dict[str, Any]]] = []
     for bucket_name in ("subtitles", "automatic_captions"):
         bucket = metadata.get(bucket_name) or {}
         for language, items in bucket.items():
@@ -327,16 +353,18 @@ def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, 
                     continue
                 candidates.append(
                     (
+                        subtitle_bucket_rank(bucket_name),
                         subtitle_language_rank(language),
                         subtitle_ext_rank(ext),
+                        bucket_name,
                         language,
                         item,
                     )
                 )
     if not candidates:
         return None
-    _, _, language, item = sorted(candidates, key=lambda row: row[:2])[0]
-    return language, item
+    _, _, _, bucket_name, language, item = sorted(candidates, key=lambda row: row[:3])[0]
+    return bucket_name, language, item
 
 
 def preferred_subtitle_languages() -> list[str]:
@@ -347,12 +375,13 @@ def download_subtitle_from_metadata(metadata: dict[str, Any], paths: AnalysisPat
     selection = choose_subtitle_track_from_metadata(metadata)
     if selection is None:
         return None
-    language, item = selection
+    bucket_name, language, item = selection
     url = item.get("url")
     if not url:
         return None
     ext = str(item.get("ext", "vtt")).lower()
-    subtitle_path = paths.subtitles_dir / f"{metadata.get('id', 'video')}.{language}.{ext}"
+    marker = subtitle_bucket_marker(bucket_name)
+    subtitle_path = paths.subtitles_dir / f"{metadata.get('id', 'video')}.{language}.{marker}.{ext}"
     with urlopen(str(url)) as response:
         payload = response.read()
     subtitle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,7 +463,7 @@ def transcript_from_subtitles(subtitle_path: Path, paths: AnalysisPaths) -> dict
     language = detect_language_from_filename(subtitle_path)
     transcript = transcript_from_segments(
         segments,
-        source="subtitle",
+        source=detect_subtitle_source_from_filename(subtitle_path),
         language=language,
         source_path=str(subtitle_path.relative_to(paths.root)),
     )
@@ -757,7 +786,7 @@ def download_youtube_subtitles(url: str, paths: AnalysisPaths) -> None:
         "subtitleslangs": preferred_subtitle_languages(),
         "subtitlesformat": "vtt",
         "outtmpl": {
-            "subtitle": str(paths.subtitles_dir / "%(id)s.%(language)s.%(ext)s"),
+            "subtitle": str(paths.subtitles_dir / "%(id)s.%(language)s.manual.%(ext)s"),
         },
     }
     with YoutubeDL(subtitle_opts) as ydl:
@@ -782,6 +811,11 @@ def download_youtube_media(
                 download_subtitle_from_metadata(metadata_hint, paths)
             except Exception:
                 pass
+    if choose_subtitle_file(paths.subtitles_dir) is None and metadata_hint is not None:
+        try:
+            download_subtitle_from_metadata(metadata_hint, paths)
+        except Exception:
+            pass
     video_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -808,10 +842,17 @@ def ensure_source_file(paths: AnalysisPaths, source: str) -> None:
     paths.source_path.write_text(source + "\n", encoding="utf-8")
 
 
-def transcript_strategy_auto(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+def transcript_from_preferred_subtitles(paths: AnalysisPaths) -> dict[str, Any] | None:
     subtitle_file = choose_subtitle_file(paths.subtitles_dir)
-    if subtitle_file is not None:
-        return transcript_from_subtitles(subtitle_file, paths)
+    if subtitle_file is None:
+        return None
+    return transcript_from_subtitles(subtitle_file, paths)
+
+
+def transcript_strategy_auto(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+    subtitle_transcript = transcript_from_preferred_subtitles(paths)
+    if subtitle_transcript is not None:
+        return subtitle_transcript
     try:
         return transcribe_with_whisper(audio_path, paths)
     except Exception:
@@ -942,19 +983,33 @@ def analyze_source(
             metadata, video_path = materialize_local_input(source_path.resolve(), paths)
             audio_input = video_path or source_path.resolve()
 
-        normalized_audio = extract_audio(audio_input, paths.audio_dir)
+        subtitle_transcript = None
+        if transcript_mode in {"auto", "subtitles", "whisper", "api"}:
+            subtitle_transcript = transcript_from_preferred_subtitles(paths)
+
+        normalized_audio: Path | None = None
+        if subtitle_transcript is None and transcript_mode in {"auto", "whisper", "api"}:
+            normalized_audio = extract_audio(audio_input, paths.audio_dir)
 
         if transcript_mode == "auto":
-            transcript = transcript_strategy_auto(normalized_audio, paths)
+            if subtitle_transcript is not None:
+                transcript = subtitle_transcript
+            else:
+                transcript = transcript_strategy_auto(normalized_audio, paths)
         elif transcript_mode == "subtitles":
-            subtitle_file = choose_subtitle_file(paths.subtitles_dir)
-            if subtitle_file is None:
+            if subtitle_transcript is None:
                 raise FileNotFoundError("No subtitle file is available for transcript_mode=subtitles.")
-            transcript = transcript_from_subtitles(subtitle_file, paths)
+            transcript = subtitle_transcript
         elif transcript_mode == "api":
-            transcript = transcribe_with_openai_skill(normalized_audio, paths)
+            if subtitle_transcript is not None:
+                transcript = subtitle_transcript
+            else:
+                transcript = transcribe_with_openai_skill(normalized_audio, paths)
         elif transcript_mode == "whisper":
-            transcript = transcribe_with_whisper(normalized_audio, paths)
+            if subtitle_transcript is not None:
+                transcript = subtitle_transcript
+            else:
+                transcript = transcribe_with_whisper(normalized_audio, paths)
         else:
             raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
 
