@@ -28,6 +28,49 @@ DIGIT_CHARACTER_PATTERN = re.compile(r"\d")
 VISIBLE_CHARACTER_PATTERN = re.compile(r"\S")
 
 
+def _strip_env_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def find_dotenv_path(start: Path | None = None) -> Path | None:
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / ".env"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_dotenv_file(path: Path) -> dict[str, str]:
+    loaded: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            continue
+        if key in os.environ:
+            continue
+        resolved = _strip_env_value(value)
+        os.environ[key] = resolved
+        loaded[key] = resolved
+    return loaded
+
+
+def load_local_env(start: Path | None = None) -> dict[str, str]:
+    dotenv_path = find_dotenv_path(start)
+    if dotenv_path is None:
+        return {}
+    return load_dotenv_file(dotenv_path)
+
+
 @dataclass(frozen=True)
 class AnalysisPaths:
     root: Path
@@ -1641,6 +1684,7 @@ def analyze_source(
     cleanup_intermediates: bool = True,
     review_input: Callable[[str], str] = input,
 ) -> Path:
+    load_local_env()
     source_path = Path(source).expanduser()
     metadata_hint: dict[str, Any] | None = None
     if looks_like_url(source):
@@ -1939,6 +1983,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_local_env()
     args = parse_args(argv)
     output_root = analyze_source(
         args.source,

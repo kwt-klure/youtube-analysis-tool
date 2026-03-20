@@ -94,6 +94,30 @@ OpenAI is optional:
 
 - `--gpt on` needs a valid `OPENAI_API_KEY`
 - API transcription fallback also needs `OPENAI_API_KEY`
+- the tool will automatically load `.env` from the current working directory or
+  one of its parent directories
+
+The built-in GPT workflow is currently OpenAI-only. If you want to use another
+LLM provider, the intended path today is to run with `--gpt off` and feed the
+resulting `output.json` into your own downstream model workflow.
+
+### API Key Setup
+
+For GPT-backed features, copy `.env.example` to `.env` and fill in your key:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+```bash
+OPENAI_API_KEY=your_real_key_here
+```
+
+You can still use a normal exported environment variable if you prefer. The
+local `.env` file is only a convenience path for people using the repo
+directly.
 
 ### Python Package
 
@@ -147,6 +171,12 @@ Try local Whisper when there are no usable subtitles:
 youtube-analyze --source /path/to/video.mp4 --transcript whisper
 ```
 
+Enable GPT after your API key is set:
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --gpt on
+```
+
 ## Common Run Patterns
 
 ### Fastest Useful Run For Subtitle-Rich Videos
@@ -175,6 +205,36 @@ youtube-analyze --source /path/to/video.mp4 --artifacts debug
 
 This keeps stage outputs such as `triage/`, `review/`, `routing/`, and
 `visuals/` for inspection.
+
+## What `--gpt on` Actually Sends
+
+GPT is still opt-in and off by default.
+
+The built-in GPT path is currently OpenAI-only. That does **not** mean the
+project is OpenAI-only overall: the canonical `output.json` bundle is meant to
+be provider-neutral. If you prefer another LLM, keep `--gpt off` and hand
+`output.json` to your own Claude, Gemini, OpenRouter, local-model, or custom
+agent workflow.
+
+When you enable it, the tool does **not** upload the entire video and it does
+**not** send the whole `output.json` bundle as-is.
+
+Current behavior is:
+
+1. segment pass
+   - only segments marked `approved_for_gpt` are sent
+   - each approved segment sends:
+     - routing label
+     - OCR summary
+     - transcript window text
+     - up to 3 representative frames
+2. final synthesis pass
+   - compact metadata
+   - the full transcript text
+   - the segment analyses returned by the first pass
+
+This means the biggest GPT-side payload is usually the final synthesis step,
+not the per-segment image pass.
 
 ## Transcript Resolution
 

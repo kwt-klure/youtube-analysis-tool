@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +33,9 @@ from youtube_analysis_tool.pipeline import (
     download_youtube_subtitles,
     duration_seconds,
     extract_interval_keyframes,
+    find_dotenv_path,
+    load_dotenv_file,
+    load_local_env,
     parse_args,
     parse_subtitle_file,
     preferred_subtitle_languages,
@@ -218,6 +222,46 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual("minimal", args.artifacts)
         self.assertFalse(args.review_reset)
         self.assertFalse(args.keep_intermediates)
+
+
+class DotenvLoadingTests(unittest.TestCase):
+    def test_find_dotenv_path_walks_up_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            dotenv_path = root / ".env"
+            dotenv_path.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+            found = find_dotenv_path(nested)
+
+        self.assertEqual(dotenv_path.resolve(), found.resolve())
+
+    def test_load_dotenv_file_sets_missing_env_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv_path = Path(tmpdir) / ".env"
+            dotenv_path.write_text(
+                '# comment\nexport OPENAI_API_KEY="from-dotenv"\nEMPTY_OK=\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                loaded = load_dotenv_file(dotenv_path)
+                self.assertEqual("from-dotenv", os.environ["OPENAI_API_KEY"])
+                self.assertEqual("", os.environ["EMPTY_OK"])
+                self.assertEqual("from-dotenv", loaded["OPENAI_API_KEY"])
+
+    def test_load_local_env_does_not_override_exported_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".env").write_text("OPENAI_API_KEY=from-dotenv\n", encoding="utf-8")
+            nested = root / "work"
+            nested.mkdir()
+
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "already-set"}, clear=True):
+                loaded = load_local_env(nested)
+
+                self.assertEqual({}, loaded)
+                self.assertEqual("already-set", os.environ["OPENAI_API_KEY"])
 
 
 class TranscriptPolicyTests(unittest.TestCase):
