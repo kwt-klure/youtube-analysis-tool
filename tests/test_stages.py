@@ -287,7 +287,7 @@ class OutputBundleTests(unittest.TestCase):
                     "segments": [{"start": 0.0, "end": 1.0, "text": "Revenue is up."}],
                 },
                 ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
-                burned_subtitles={"mode": "auto", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
                 visuals_payload={
                     "slides": [
                         {
@@ -348,7 +348,7 @@ class OutputBundleTests(unittest.TestCase):
         self.assertEqual("minimal", written["processing"]["artifact_mode"])
         self.assertEqual("auto", written["processing"]["transcript_mode"])
         self.assertEqual("auto", written["processing"]["ocr_mode"])
-        self.assertEqual("auto", written["processing"]["burned_subtitles_mode"])
+        self.assertEqual("off", written["processing"]["burned_subtitles_mode"])
         self.assertEqual("not_attempted", written["processing"]["burned_subtitles_status"])
         self.assertIsNone(written["processing"]["burned_subtitles_reason"])
         self.assertEqual(0, written["processing"]["burned_subtitles_probe_hits"])
@@ -373,7 +373,7 @@ class OutputBundleTests(unittest.TestCase):
                 metadata={"id": "demo", "title": "Demo"},
                 transcript={"source": "subtitle", "text": "Revenue is up.", "segments": []},
                 ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
-                burned_subtitles={"mode": "auto", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
                 visuals_payload={"slides": [], "charts": []},
                 errors=[],
                 cleanup_intermediates=True,

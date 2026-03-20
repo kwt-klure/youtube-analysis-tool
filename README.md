@@ -90,6 +90,9 @@ The local Whisper CLI is only needed when the transcript path falls back to
 local transcription. If a usable subtitle track exists, the tool will prefer
 that and skip Whisper.
 
+The CLI also prints simple phase progress to `stderr` while it runs. It is
+intentionally stage-based, not a fake universal percentage bar.
+
 OpenAI is optional:
 
 - `--gpt on` needs a valid `OPENAI_API_KEY`
@@ -171,6 +174,12 @@ Try local Whisper when there are no usable subtitles:
 youtube-analyze --source /path/to/video.mp4 --transcript whisper
 ```
 
+Opt in to burned subtitle OCR when you specifically want to try it:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --burned-subtitles on
+```
+
 Enable GPT after your API key is set:
 
 ```bash
@@ -242,16 +251,19 @@ Transcript resolution is subtitle-first:
 
 1. manual subtitles
 2. YouTube automatic captions
-3. burned subtitle OCR
-4. local Whisper
-5. OpenAI transcription fallback
+3. local Whisper
+4. OpenAI transcription fallback
+
+Optional burned subtitle OCR can be inserted before Whisper with
+`--burned-subtitles on`. It is currently disabled by default because Whisper is
+the more reliable general fallback.
 
 Important details:
 
 - if any usable subtitle track exists, it wins over Whisper
 - language preference affects ordering, but any usable subtitle beats Whisper
-- burned subtitle OCR is local and conservative
-- in `auto` mode, burned subtitle OCR is allowed to fail fast and fall back
+- burned subtitle OCR is local, conservative, and opt-in by default
+- if you enable it, it is allowed to fail fast and fall back
 - if subtitles satisfy transcript resolution, the tool skips audio extraction
   for transcript work
 
@@ -536,8 +548,8 @@ Current limitations are mostly about source quality, not the output contract.
 - Japanese proper nouns, niche terminology, and low-frequency names can be wrong
 - `visuals` currently promote `slides` and `charts` only; other valuable visual
   material may stay unpromoted
-- burned subtitle OCR is intentionally conservative and should be treated as a
-  lucky local fallback, not a guaranteed transcript path
+- burned subtitle OCR is intentionally conservative and should be treated as an
+  opt-in lucky fallback, not a guaranteed transcript path
 - the tool is better at preserving high-level structure than exact scene-by-scene
   reconstruction when the transcript is noisy
 
@@ -570,7 +582,7 @@ Implemented behavior includes:
 - subtitle-first transcript strategy
 - local Whisper fallback with OpenAI transcription as final fallback
 - local OCR with `auto|off|on`
-- burned subtitle OCR fallback with fast fail behavior
+- burned subtitle OCR fallback with fast fail behavior (disabled by default)
 - heuristic triage with dedupe, blur scoring, motion proxy, and routing labels
 - optional GPT segment analysis plus final zh-TW report
 - optional debug-mode trace artifacts

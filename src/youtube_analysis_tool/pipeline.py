@@ -140,6 +140,25 @@ def hms_from_seconds(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def format_progress_line(phase: str, message: str) -> str:
+    return f"[{phase}] {message}"
+
+
+class StderrProgressReporter:
+    def __init__(self, stream: Any = None) -> None:
+        self.stream = stream or sys.stderr
+
+    def __call__(self, phase: str, message: str) -> None:
+        self.stream.write(format_progress_line(phase, message) + "\n")
+        self.stream.flush()
+
+
+def report_progress(progress_callback: Callable[[str, str], None] | None, phase: str, message: str) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(phase, message)
+
+
 def default_output_dir_for_source(
     source: str,
     video_id: str | None = None,
@@ -1583,13 +1602,24 @@ def transcript_from_preferred_subtitles(paths: AnalysisPaths) -> dict[str, Any] 
     return transcript_from_subtitles(subtitle_file, paths)
 
 
-def transcript_strategy_auto(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+def transcript_strategy_auto(
+    audio_path: Path,
+    paths: AnalysisPaths,
+    *,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     subtitle_transcript = transcript_from_preferred_subtitles(paths)
     if subtitle_transcript is not None:
         return subtitle_transcript
+    report_progress(progress_callback, "transcript", "Running local Whisper transcription")
     try:
         return transcribe_with_whisper(audio_path, paths)
     except Exception:
+        report_progress(
+            progress_callback,
+            "transcript",
+            "Local Whisper failed; falling back to OpenAI transcription",
+        )
         return transcribe_with_openai_skill(audio_path, paths)
 
 
@@ -1683,11 +1713,13 @@ def analyze_source(
     review_reset: bool = False,
     cleanup_intermediates: bool = True,
     review_input: Callable[[str], str] = input,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> Path:
     load_local_env()
     source_path = Path(source).expanduser()
     metadata_hint: dict[str, Any] | None = None
     if looks_like_url(source):
+        report_progress(progress_callback, "metadata", "Fetching YouTube metadata")
         metadata_hint = fetch_youtube_metadata(source)
     output_root = out_dir or default_output_dir_for_source(
         source,
@@ -1713,20 +1745,31 @@ def analyze_source(
         if looks_like_url(source):
             metadata = metadata_hint or fetch_youtube_metadata(source)
             write_json(paths.metadata_path, metadata)
+            report_progress(progress_callback, "download", "Downloading source media")
             metadata, video_path = download_youtube_media(source, paths, metadata_hint=metadata)
             audio_input = video_path
         else:
             if not source_path.exists():
                 raise FileNotFoundError(f"Source file does not exist: {source_path}")
+            report_progress(progress_callback, "source", "Inspecting local media")
             metadata, video_path = materialize_local_input(source_path.resolve(), paths)
             audio_input = video_path or source_path.resolve()
 
         subtitle_transcript = None
         if transcript_mode in {"auto", "subtitles", "whisper", "api"}:
+            report_progress(progress_callback, "transcript", "Checking text-track subtitles")
             subtitle_transcript = transcript_from_preferred_subtitles(paths)
 
         burned_subtitle_transcript = None
         if subtitle_transcript is None and transcript_mode in {"auto", "whisper", "api"}:
+            if burned_subtitles_mode == "off":
+                report_progress(progress_callback, "transcript", "Skipping burned subtitle OCR (disabled)")
+            else:
+                report_progress(
+                    progress_callback,
+                    "transcript",
+                    f"Trying burned subtitle OCR ({burned_subtitles_mode})",
+                )
             burned_subtitle_transcript, burned_subtitles_state = run_burned_subtitles_stage(
                 video_path,
                 metadata,
@@ -1740,37 +1783,58 @@ def analyze_source(
             and burned_subtitle_transcript is None
             and transcript_mode in {"auto", "whisper", "api"}
         ):
+            report_progress(progress_callback, "audio", "Extracting normalized audio for transcription")
             normalized_audio = extract_audio(audio_input, paths.audio_dir)
 
         if transcript_mode == "auto":
             if subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using text-track subtitles")
                 transcript = subtitle_transcript
             elif burned_subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
                 transcript = burned_subtitle_transcript
             else:
-                transcript = transcript_strategy_auto(normalized_audio, paths)
+                if progress_callback is None:
+                    transcript = transcript_strategy_auto(normalized_audio, paths)
+                else:
+                    transcript = transcript_strategy_auto(
+                        normalized_audio,
+                        paths,
+                        progress_callback=progress_callback,
+                    )
         elif transcript_mode == "subtitles":
             if subtitle_transcript is None:
                 raise FileNotFoundError("No subtitle file is available for transcript_mode=subtitles.")
+            report_progress(progress_callback, "transcript", "Using text-track subtitles")
             transcript = subtitle_transcript
         elif transcript_mode == "api":
             if subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using text-track subtitles")
                 transcript = subtitle_transcript
             elif burned_subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
                 transcript = burned_subtitle_transcript
             else:
+                report_progress(progress_callback, "transcript", "Running OpenAI transcription")
                 transcript = transcribe_with_openai_skill(normalized_audio, paths)
         elif transcript_mode == "whisper":
             if subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using text-track subtitles")
                 transcript = subtitle_transcript
             elif burned_subtitle_transcript is not None:
+                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
                 transcript = burned_subtitle_transcript
             else:
+                report_progress(progress_callback, "transcript", "Running local Whisper transcription")
                 transcript = transcribe_with_whisper(normalized_audio, paths)
         else:
             raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
 
         effective_keyframe_mode = keyframe_mode if visuals_mode == "on" else "off"
+        if effective_keyframe_mode == "off":
+            report_progress(progress_callback, "visuals", "Skipping visual pipeline")
+        else:
+            report_progress(progress_callback, "visuals", "Extracting keyframes")
 
         keyframe_rows = create_keyframes(
             video_path,
@@ -1782,6 +1846,8 @@ def analyze_source(
         )
 
         try:
+            if keyframe_rows and ocr_mode != "off":
+                report_progress(progress_callback, "visuals", "Running frame OCR")
             ocr_rows, ocr_state = run_ocr_stage(paths, keyframe_rows, ocr_mode=ocr_mode)
         except Exception as exc:
             ocr_state = default_ocr_state(ocr_mode)
@@ -1791,6 +1857,7 @@ def analyze_source(
             raise
 
         if triage_mode == "on" and keyframe_rows:
+            report_progress(progress_callback, "visuals", "Running local triage")
             frames, segments = triage.run_local_triage(paths.root, keyframe_rows, ocr_rows, transcript)
             manifest_entries = [
                 routing.manifest_entry_from_segment(segment, gpt_model)
@@ -1818,6 +1885,7 @@ def analyze_source(
             segments = []
             write_empty_stage_artifacts(paths)
 
+        report_progress(progress_callback, "visuals", "Assembling retained visuals")
         visuals_payload = visuals.build_embedded_visuals(
             paths.root,
             frames=frames,
@@ -1835,6 +1903,7 @@ def analyze_source(
         if gpt_mode == "on":
             approved_entries = [entry for entry in manifest_entries if entry.get("approved_for_gpt")]
             if approved_entries or transcript.get("text", "").strip():
+                report_progress(progress_callback, "gpt", "Running GPT analysis")
                 segment_analyses, final_report = gpt.analyze_segments(
                     paths.root,
                     manifest_entries,
@@ -1858,7 +1927,9 @@ def analyze_source(
         save_error(paths, error["stage"], error["message"])
         raise
     finally:
+        report_progress(progress_callback, "output", "Writing output bundle")
         if cleanup_intermediates:
+            report_progress(progress_callback, "cleanup", "Removing intermediate media artifacts")
             cleanup_intermediate_artifacts(paths)
         reporting.write_output_file(
             paths,
@@ -1880,6 +1951,7 @@ def analyze_source(
             gpt_payload=gpt_payload,
         )
         if artifacts_mode == "minimal":
+            report_progress(progress_callback, "cleanup", "Removing non-debug artifacts")
             cleanup_non_debug_artifacts(paths)
 
 
@@ -2003,6 +2075,7 @@ def main(argv: list[str] | None = None) -> int:
         artifacts_mode=args.artifacts,
         review_reset=args.review_reset,
         cleanup_intermediates=not args.keep_intermediates,
+        progress_callback=StderrProgressReporter(),
     )
     print(output_root)
     return 0

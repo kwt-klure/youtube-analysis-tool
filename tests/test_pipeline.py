@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -42,6 +43,7 @@ from youtube_analysis_tool.pipeline import (
     parse_srt_or_vtt,
     preprocess_burned_subtitle_image,
     run_ocr_stage,
+    main,
     transcribe_burned_subtitles,
     transcript_from_subtitles,
     transcript_strategy_auto,
@@ -213,7 +215,7 @@ class CliArgumentTests(unittest.TestCase):
 
         self.assertEqual("on", args.visuals)
         self.assertEqual("auto", args.ocr)
-        self.assertEqual("auto", args.burned_subtitles)
+        self.assertEqual("off", args.burned_subtitles)
         self.assertEqual("on", args.triage)
         self.assertEqual("off", args.gpt)
         self.assertEqual("interactive", args.review)
@@ -222,6 +224,26 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual("minimal", args.artifacts)
         self.assertFalse(args.review_reset)
         self.assertFalse(args.keep_intermediates)
+
+    def test_main_wires_progress_to_stderr_without_polluting_stdout(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def fake_analyze_source(*args, **kwargs):
+            progress_callback = kwargs.get("progress_callback")
+            self.assertIsNotNone(progress_callback)
+            progress_callback("transcript", "Running local Whisper transcription")
+            return Path("/tmp/out")
+
+        with mock.patch("youtube_analysis_tool.pipeline.analyze_source", side_effect=fake_analyze_source), mock.patch(
+            "sys.stdout",
+            stdout,
+        ), mock.patch("sys.stderr", stderr):
+            exit_code = main(["--source", "/tmp/demo.mp4"])
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("[transcript] Running local Whisper transcription", stderr.getvalue())
+        self.assertEqual("/tmp/out\n", stdout.getvalue())
 
 
 class DotenvLoadingTests(unittest.TestCase):
