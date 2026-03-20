@@ -1,64 +1,63 @@
 # YouTube Analysis Tool
 
-Local-first, token-efficient YouTube analysis that produces a single AI-ready `output.json`.
+Local-first YouTube and video analysis that writes one canonical AI-facing
+bundle: `output.json`.
 
-This project is built around one default: do the cheap work locally first, then
-escalate to GPT only when that extra semantic layer is actually worth paying
-for. A normal run is designed for downstream AI consumption, not for browsing a
-pile of side artifacts by hand.
+This project is built for a specific workflow:
 
-## AI-First, Not Human-First
+1. do the cheap extraction work locally
+2. preserve transcript, timing, visuals, and provenance in one place
+3. let another model decide what is worth deeper reasoning
 
-The default output is intentionally shaped for another model to read, not for a
-person to casually skim in a text editor.
+The default output is intentionally optimized for downstream AI consumption, not
+for a human skimming raw JSON in a text editor.
+
+## What This Is
+
+`youtube-analysis-tool` takes a YouTube URL or local media file and produces a
+single structured bundle that another model can read directly.
+
+The default run tries to answer:
+
+- what was said
+- when it was said
+- which visuals were important enough to keep
+- where those visuals came from
+- how trustworthy the transcript source is
+
+Instead of leaving you with a pile of loosely related artifacts, the tool folds
+the useful parts into one `output.json`.
+
+## What This Is Not
+
+This is not a polished end-user summarizer.
+
+It does not try to:
+
+- replace human judgment
+- produce perfect semantic understanding locally
+- turn every video into a pretty human-readable report
+- send the whole video to GPT by default
+
+The project is deliberately narrower than that. It focuses on extraction,
+alignment, provenance, and cost discipline.
+
+## Why The Output Looks Dense
+
+The default output is shaped for AI, not for comfortable human reading.
 
 That means:
 
-- one canonical `output.json` instead of a pile of sibling artifacts
+- one canonical `output.json` instead of many sibling files
 - full transcript inline, because downstream AI benefits from direct context
-- retained visuals embedded inline, because AI should not have to chase image paths
-- explicit provenance and source labeling, so downstream readers know what came
-  from subtitles, Whisper, OCR, or heuristic routing
+- retained visuals embedded inline, so AI does not have to chase image paths
+- explicit provenance fields, so downstream readers know whether a transcript
+  came from manual subtitles, YouTube auto captions, burned subtitle OCR, or
+  local Whisper
 
-It also means `output.json` is not optimized to feel pleasant for direct human
-reading. It is a machine-facing bundle first.
+If you open the JSON yourself, it may feel dense or ugly. That is expected.
 
-## Status
-
-The current v1 core path is validated and intentionally stable.
-
-- long YouTube runs complete on local hardware
-- the default `minimal` single-file contract is holding up
-- output size remains practical even on long inputs
-- downstream AI can read and reason over the resulting bundle
-
-Unless a real failure signal shows up, the project should prefer stability over
-gratuitous rewrites.
-
-## Validated Cases
-
-The current implementation has already been exercised against:
-
-- short and mid-length YouTube videos with existing subtitles
-- YouTube videos without usable captions, using local Whisper fallback
-- long-form inputs where a single `output.json` still remained manageable
-- local-only runs with `--gpt off`
-
-This does not mean every transcript is clean. It means the core path is
-producing usable AI-ready bundles across the kinds of runs it was designed for.
-
-## Known Limits
-
-Current limitations are mostly about source quality, not the output contract.
-
-- no-caption videos depend on local Whisper, so transcript quality can drift
-- Japanese proper nouns, niche terminology, and low-frequency names can be wrong
-- `visuals` currently promote `slides` and `charts` only; other valuable visual
-  material may stay unpromoted
-- the tool is better at preserving high-level structure than exact scene-by-scene
-  reconstruction when the transcript is noisy
-
-## What The Default Run Gives You
+## What A Default Run Gives You
 
 Running `youtube-analyze --source ...` with no extra flags:
 
@@ -75,28 +74,151 @@ Running `youtube-analyze --source ...` with no extra flags:
 self-contained and does not depend on sibling JSON files, image folders, or
 report files.
 
-If you open it yourself, it may feel dense or even ugly. That is expected. The
-design target is "easy for downstream AI to ingest," not "pleasant for humans
-to browse raw."
+## Installation
 
-## Why This Exists
+### Requirements
 
-Many video-analysis tools follow a costly pattern:
+You will usually want these tools available on your system `PATH`:
 
-1. extract lots of frames
-2. send most or all of them to a vision model
-3. pay token cost for repeated slides, talking heads, transitions, and other low-value footage
+- `ffmpeg`
+- `ffprobe`
+- `yt-dlp`
+- `tesseract`
+- `whisper`
 
-This tool takes a different path:
+The local Whisper CLI is only needed when the transcript path falls back to
+local transcription. If a usable subtitle track exists, the tool will prefer
+that and skip Whisper.
 
-- local transcript extraction first
-- local OCR first
-- local heuristic triage first
-- selective promotion of `slides` and `charts`
-- optional GPT only after the cheap filtering work is done
+OpenAI is optional:
 
-The goal is not just "analyze a YouTube video." The goal is to reduce
-information overload without wasting tokens on frames that carry little value.
+- `--gpt on` needs a valid `OPENAI_API_KEY`
+- API transcription fallback also needs `OPENAI_API_KEY`
+
+### Python Package
+
+Install the package in editable mode with the optional YouTube dependencies:
+
+```bash
+python3 -m pip install -e '.[youtube]'
+```
+
+## Quick Start
+
+Run on a YouTube URL:
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+Run on a local file:
+
+```bash
+youtube-analyze --source /path/to/video.mp4
+```
+
+Use GPT only when you explicitly want the extra semantic layer:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --gpt on
+```
+
+Keep debug artifacts instead of only the canonical bundle:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --artifacts debug
+```
+
+Skip the entire visual pipeline for transcript-only runs:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --visuals off
+```
+
+Force a fully local transcript path when subtitles are available:
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --transcript subtitles
+```
+
+Try local Whisper when there are no usable subtitles:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --transcript whisper
+```
+
+## Common Run Patterns
+
+### Fastest Useful Run For Subtitle-Rich Videos
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --visuals off
+```
+
+Use this when you mostly care about transcript and timing. If a usable subtitle
+track exists, the tool should skip burned subtitle OCR, skip Whisper, and avoid
+all visual work.
+
+### Normal Local-First Run
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+This keeps transcript plus retained visuals in a single AI-facing bundle.
+
+### Inspect Internals
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --artifacts debug
+```
+
+This keeps stage outputs such as `triage/`, `review/`, `routing/`, and
+`visuals/` for inspection.
+
+## Transcript Resolution
+
+Transcript resolution is subtitle-first:
+
+1. manual subtitles
+2. YouTube automatic captions
+3. burned subtitle OCR
+4. local Whisper
+5. OpenAI transcription fallback
+
+Important details:
+
+- if any usable subtitle track exists, it wins over Whisper
+- language preference affects ordering, but any usable subtitle beats Whisper
+- burned subtitle OCR is local and conservative
+- in `auto` mode, burned subtitle OCR is allowed to fail fast and fall back
+- if subtitles satisfy transcript resolution, the tool skips audio extraction
+  for transcript work
+
+This makes subtitle-rich videos much cheaper and faster than videos that must
+go through local Whisper.
+
+## Visual Pipeline
+
+The visual pipeline is separate from transcript resolution.
+
+With `--visuals on`, the tool may:
+
+- extract keyframes
+- run local OCR on frames
+- run local triage
+- retain promoted visuals as `slides` and `charts`
+- embed primary images inline in `output.json`
+
+With `--visuals off`, the tool hard-skips:
+
+- keyframe extraction
+- frame OCR
+- local triage
+- visual bundle assembly
+
+This is useful when a video already has good subtitles and visuals are not
+worth the extra local cost for that run.
 
 ## Output Contract
 
@@ -111,7 +233,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.1",
+  "output_version": "1.0.2",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -126,6 +248,15 @@ Top-level shape:
 }
 ```
 
+### `metadata`
+
+The canonical metadata section is normalized for downstream use. It keeps the
+useful fields such as title, uploader, duration, upload date, and chapters when
+available. It is not meant to dump the entire raw `yt-dlp` metadata matrix in
+minimal mode.
+
+### `transcript`
+
 `transcript` contains:
 
 - `source`
@@ -135,7 +266,15 @@ Top-level shape:
 - `segment_count`
 - `provenance`
 
-`visuals` contains only the AI-facing buckets:
+This is intentionally redundant from a human perspective. Another model usually
+benefits from having both:
+
+- the full semantic context in `full_text`
+- the timestamped alignment in `segments`
+
+### `visuals`
+
+`visuals` contains only the canonical AI-facing buckets:
 
 - `slides`
 - `charts`
@@ -159,67 +298,27 @@ In minimal mode, `images` normally contains exactly one Base64-embedded primary
 image. The full OCR text stays inline because it is usually more useful to AI
 than extra near-duplicate frames.
 
-`provenance` exists because not all sources are equally trustworthy. Manual
-subtitles, YouTube auto captions, burned subtitle OCR, and Whisper output should
-not be treated as if they have the same confidence profile.
+### `processing`
 
-## Transcript And OCR Behavior
+`processing` is intentionally compact. It records what modes were selected and
+what path the run took, without regrowing into a full trace dump.
 
-Transcript resolution is subtitle-first:
+Fields here include things like:
 
-1. manual subtitles
-2. YouTube automatic captions
-3. burned subtitle OCR
-4. local Whisper
-5. OpenAI transcription fallback
+- transcript mode
+- visuals mode
+- artifact mode
+- GPT mode
+- burned subtitle OCR status
+- compact counts
 
-If any usable subtitle track exists, the tool uses it directly even when the
-language is not in the preferred list. Language preference still affects which
-subtitle gets picked first, but any available subtitle beats Whisper.
+### `provenance`
 
-When transcript resolution succeeds from subtitles, the tool skips audio
-extraction for transcript work. This optimization does not reduce the visual
-pipeline: video download, keyframe extraction, OCR, triage, and retained
-visuals still run as usual.
+`provenance` exists because not all sources are equally trustworthy.
 
-If you want a fully local run with no OpenAI usage at all, use:
-
-```bash
-youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --transcript subtitles
-```
-
-or:
-
-```bash
-youtube-analyze --source /path/to/video.mp4 --transcript whisper
-```
-
-OCR is always local. The default is `--ocr auto`, which means:
-
-- try OCR when keyframes exist
-- keep going if OCR fails
-- record the degraded state in `output.json`
-
-Burned subtitle OCR is also local, but it is intentionally conservative. In
-`auto` mode it is allowed to fail fast and fall back to Whisper. If it succeeds,
-that is a bonus path, not the primary contract.
-
-If you want transcript-only behavior for a specific run, you can turn off the
-entire visual pipeline:
-
-```bash
-youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --visuals off
-```
-
-This is a hard skip for:
-
-- keyframe extraction
-- frame OCR
-- local triage
-- embedded `visuals` output
-
-Transcript resolution still follows the normal subtitle / burned subtitle /
-Whisper precedence.
+Manual subtitles, YouTube auto captions, burned subtitle OCR, and Whisper do
+not have the same confidence profile. The bundle tries to say that explicitly
+instead of pretending every transcript source is equal.
 
 ## Artifact Modes
 
@@ -260,58 +359,59 @@ This keeps runs readable while still preserving a stable unique suffix. If a
 title is unavailable, the tool falls back to the video id. Local files continue
 to use the file stem.
 
-## Quick Start
+## Why This Project Exists
 
-Install the package in editable mode with the optional YouTube dependencies:
+Many video-analysis tools follow an expensive pattern:
 
-```bash
-python3 -m pip install -e '.[youtube]'
-```
+1. extract lots of frames
+2. send most or all of them to a vision model
+3. pay token cost for repeated slides, talking heads, transitions, and other
+   low-value footage
 
-Run on a YouTube URL:
+This project takes a different path:
 
-```bash
-youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
-```
+- local transcript extraction first
+- local OCR first
+- local heuristic triage first
+- selective promotion of `slides` and `charts`
+- optional GPT only after the cheap filtering work is done
 
-Run on a local file:
+The goal is not just "analyze a YouTube video." The goal is to reduce
+information overload without wasting tokens on frames that carry little value.
 
-```bash
-youtube-analyze --source /path/to/video.mp4
-```
+## Current Status
 
-Enable GPT only when you want the extra semantic layer:
+The current v1 core path is validated and intentionally stable.
 
-```bash
-youtube-analyze --source /path/to/video.mp4 --gpt on
-```
+- long YouTube runs complete on local hardware
+- the default `minimal` single-file contract is holding up
+- output size remains practical even on long inputs
+- downstream AI can read and reason over the resulting bundle
 
-Disable interactive review for a more batch-like GPT run:
+Unless a real failure signal shows up, the project should prefer stability over
+gratuitous rewrites.
 
-```bash
-youtube-analyze --source /path/to/video.mp4 --gpt on --review off
-```
+## Known Limits
 
-Keep debug artifacts:
+Current limitations are mostly about source quality, not the output contract.
 
-```bash
-youtube-analyze --source /path/to/video.mp4 --artifacts debug
-```
-
-Skip visuals entirely:
-
-```bash
-youtube-analyze --source /path/to/video.mp4 --visuals off
-```
+- no-caption videos depend on local Whisper, so transcript quality can drift
+- Japanese proper nouns, niche terminology, and low-frequency names can be wrong
+- `visuals` currently promote `slides` and `charts` only; other valuable visual
+  material may stay unpromoted
+- burned subtitle OCR is intentionally conservative and should be treated as a
+  lucky local fallback, not a guaranteed transcript path
+- the tool is better at preserving high-level structure than exact scene-by-scene
+  reconstruction when the transcript is noisy
 
 ## Current Local-First Pipeline
 
 The current implementation does this:
 
 1. normalize media locally
-2. extract transcript locally first when possible
-3. extract candidate keyframes locally
-4. run local OCR and heuristic frame triage
+2. resolve transcript from the cheapest trustworthy source available
+3. optionally extract candidate keyframes locally
+4. optionally run local OCR and heuristic frame triage
 5. promote retained visuals into a single AI-friendly bundle
 6. optionally run GPT on the filtered subset
 
@@ -323,16 +423,17 @@ The main local tools are:
 - `tesseract`
 - `opencv`
 
-Current implemented behavior includes:
+Implemented behavior includes:
 
 - URL or local-file input
 - canonical `output.json` artifact per run
 - full transcript embedded in the canonical output
 - `slides` / `charts` visual galleries embedded in the canonical output
 - one inline primary image per visual item in minimal mode
-- local OCR with `auto|off|on`
 - subtitle-first transcript strategy
 - local Whisper fallback with OpenAI transcription as final fallback
+- local OCR with `auto|off|on`
+- burned subtitle OCR fallback with fast fail behavior
 - heuristic triage with dedupe, blur scoring, motion proxy, and routing labels
 - optional GPT segment analysis plus final zh-TW report
 - optional debug-mode trace artifacts
