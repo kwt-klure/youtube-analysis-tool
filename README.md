@@ -308,6 +308,83 @@ Top-level shape:
 }
 ```
 
+Small truncated example:
+
+```json
+{
+  "output_version": "1.0.2",
+  "source": {
+    "kind": "youtube",
+    "input": "https://www.youtube.com/watch?v=VIDEO_ID"
+  },
+  "metadata": {
+    "id": "VIDEO_ID",
+    "title": "Example Video",
+    "uploader": "Example Channel",
+    "duration_seconds": 742.0
+  },
+  "transcript": {
+    "source": "subtitle_auto",
+    "language": "ja",
+    "segment_count": 1573,
+    "full_text": ".... full transcript text omitted ....",
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 2.4,
+        "text": "第一段字幕"
+      }
+    ],
+    "provenance": {
+      "kind": "subtitle_auto",
+      "quality_notes": [
+        "text_track_subtitles"
+      ]
+    }
+  },
+  "visuals": {
+    "slides": [
+      {
+        "segment_id": "segment-0002",
+        "effective_label": "slide",
+        "start_hms": "00:04:00",
+        "end_hms": "00:04:36",
+        "ocr_summary": "投影片上的主要文字摘要",
+        "transcript_excerpt": "這段畫面附近的 transcript 片段",
+        "images": [
+          {
+            "filename": "interval-000240.jpg",
+            "mime_type": "image/jpeg",
+            "encoding": "base64",
+            "data": "<base64 omitted>"
+          }
+        ],
+        "primary_image_index": 0,
+        "source_segment_ref": "segments/segment-0002",
+        "provenance": {
+          "kind": "triage_promoted_visual"
+        }
+      }
+    ],
+    "charts": []
+  },
+  "processing": {
+    "transcript_mode": "auto",
+    "visuals_mode": "on",
+    "artifacts_mode": "minimal",
+    "gpt_mode": "off"
+  },
+  "provenance": {
+    "transcript_source": "subtitle_auto"
+  },
+  "errors": []
+}
+```
+
+The real bundle is usually much larger than this example because `full_text`,
+timestamped `segments`, and embedded primary images are all kept inline on
+purpose.
+
 ### `metadata`
 
 The canonical metadata section is normalized for downstream use. It keeps the
