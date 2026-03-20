@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -206,6 +207,7 @@ class CliArgumentTests(unittest.TestCase):
     def test_new_cli_flags_have_expected_defaults(self) -> None:
         args = parse_args(["--source", "/tmp/demo.mp4"])
 
+        self.assertEqual("on", args.visuals)
         self.assertEqual("auto", args.ocr)
         self.assertEqual("auto", args.burned_subtitles)
         self.assertEqual("on", args.triage)
@@ -780,6 +782,48 @@ class OcrModeTests(unittest.TestCase):
             with mock.patch("youtube_analysis_tool.pipeline.run_ocr", side_effect=RuntimeError("boom")):
                 with self.assertRaises(RuntimeError):
                     run_ocr_stage(paths, [{"filename": "frame.jpg"}], ocr_mode="on")
+
+
+class VisualsModeTests(unittest.TestCase):
+    def test_visuals_off_forces_keyframes_off_and_marks_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+            subtitle_path = output_root / "subtitles" / "demo.en.manual.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n", encoding="utf-8")
+            transcript = {"source": "subtitle_manual", "language": "en", "text": "subtitle text", "segments": []}
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({}, source_path),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=subtitle_path,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcript_from_subtitles",
+                return_value=transcript,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ) as keyframes_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts"
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="auto",
+                    visuals_mode="off",
+                    cleanup_intermediates=False,
+                )
+
+                written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("off", keyframes_mock.call_args.kwargs["mode"])
+        self.assertEqual("off", written["processing"]["visuals_mode"])
+        self.assertEqual([], written["visuals"]["slides"])
+        self.assertEqual([], written["visuals"]["charts"])
 
 
 class YoutubeDownloadFallbackTests(unittest.TestCase):

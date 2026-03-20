@@ -1625,6 +1625,7 @@ def analyze_source(
     *,
     transcript_mode: str = "auto",
     keyframe_mode: str = "scene+interval",
+    visuals_mode: str = constants.DEFAULT_VISUALS_MODE,
     ocr_mode: str = constants.DEFAULT_OCR_MODE,
     burned_subtitles_mode: str = constants.DEFAULT_BURNED_SUBTITLES_MODE,
     out_dir: Path | None = None,
@@ -1725,11 +1726,13 @@ def analyze_source(
         else:
             raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
 
+        effective_keyframe_mode = keyframe_mode if visuals_mode == "on" else "off"
+
         keyframe_rows = create_keyframes(
             video_path,
             metadata,
             paths,
-            mode=keyframe_mode,
+            mode=effective_keyframe_mode,
             interval_seconds=interval_seconds,
             threshold=scene_threshold,
         )
@@ -1825,6 +1828,7 @@ def analyze_source(
             errors=errors,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
+            visuals_mode=visuals_mode,
             ocr_mode=ocr_mode,
             burned_subtitles=burned_subtitles_state,
             gpt_mode=gpt_mode,
@@ -1851,6 +1855,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="scene+interval",
         choices=["off", "scene", "interval", "scene+interval"],
         help="Keyframe extraction strategy",
+    )
+    parser.add_argument(
+        "--visuals",
+        default=constants.DEFAULT_VISUALS_MODE,
+        choices=["off", "on"],
+        help="Enable or disable the visual pipeline (keyframes, OCR, triage, and visual extraction)",
     )
     parser.add_argument(
         "--ocr",
@@ -1934,6 +1944,7 @@ def main(argv: list[str] | None = None) -> int:
         args.source,
         transcript_mode=args.transcript,
         keyframe_mode=args.keyframes,
+        visuals_mode=args.visuals,
         ocr_mode=args.ocr,
         burned_subtitles_mode=args.burned_subtitles,
         out_dir=args.out_dir,

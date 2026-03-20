@@ -63,6 +63,7 @@ Current limitations are mostly about source quality, not the output contract.
 Running `youtube-analyze --source ...` with no extra flags:
 
 - keeps `--gpt off`
+- keeps `--visuals on`
 - keeps `--artifacts minimal`
 - writes `output/youtube/<title-id-or-stem>/output.json`
 - preserves the full transcript inline
@@ -203,6 +204,23 @@ Burned subtitle OCR is also local, but it is intentionally conservative. In
 `auto` mode it is allowed to fail fast and fall back to Whisper. If it succeeds,
 that is a bonus path, not the primary contract.
 
+If you want transcript-only behavior for a specific run, you can turn off the
+entire visual pipeline:
+
+```bash
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --visuals off
+```
+
+This is a hard skip for:
+
+- keyframe extraction
+- frame OCR
+- local triage
+- embedded `visuals` output
+
+Transcript resolution still follows the normal subtitle / burned subtitle /
+Whisper precedence.
+
 ## Artifact Modes
 
 There are two output modes.
@@ -278,6 +296,12 @@ Keep debug artifacts:
 
 ```bash
 youtube-analyze --source /path/to/video.mp4 --artifacts debug
+```
+
+Skip visuals entirely:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --visuals off
 ```
 
 ## Current Local-First Pipeline
