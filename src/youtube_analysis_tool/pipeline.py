@@ -160,6 +160,23 @@ def report_progress(progress_callback: Callable[[str, str], None] | None, phase:
     progress_callback(phase, message)
 
 
+def make_download_progress_hook(
+    progress_callback: Callable[[str, str], None] | None,
+) -> Callable[[dict[str, Any]], None]:
+    has_reported_start = False
+
+    def hook(status: dict[str, Any]) -> None:
+        nonlocal has_reported_start
+        state = str(status.get("status") or "")
+        if state == "downloading" and not has_reported_start:
+            has_reported_start = True
+            report_progress(progress_callback, "download", "Media transfer started")
+        elif state == "finished":
+            report_progress(progress_callback, "download", "Media transfer finished")
+
+    return hook
+
+
 def default_output_dir_for_source(
     source: str,
     video_id: str | None = None,
@@ -458,6 +475,7 @@ def download_selected_subtitle_track(
     bucket_name: str,
     language: str,
     ext: str,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> Path | None:
     marker = subtitle_bucket_marker(bucket_name)
     before = {path.name for path in paths.subtitles_dir.glob("*")}
@@ -465,7 +483,7 @@ def download_selected_subtitle_track(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": constants.DEFAULT_YTDLP_MEDIA_SOCKET_TIMEOUT_SECONDS,
         "skip_download": True,
         "writesubtitles": bucket_name == "subtitles",
         "writeautomaticsub": bucket_name == "automatic_captions",
@@ -479,6 +497,7 @@ def download_selected_subtitle_track(
         subtitle_opts,
         source_url,
         download=True,
+        progress_callback=progress_callback,
         phase="transcript",
         retry_message="Subtitle track fetch stalled",
     )
@@ -498,6 +517,7 @@ def download_subtitle_from_metadata(
     paths: AnalysisPaths,
     *,
     source_url: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> Path | None:
     selection = choose_subtitle_track_from_metadata(metadata)
     if selection is None:
@@ -512,6 +532,7 @@ def download_subtitle_from_metadata(
                 bucket_name=bucket_name,
                 language=language,
                 ext=ext,
+                progress_callback=progress_callback,
             )
             if result is not None:
                 return result
@@ -522,7 +543,12 @@ def download_subtitle_from_metadata(
         return None
     marker = subtitle_bucket_marker(bucket_name)
     subtitle_path = paths.subtitles_dir / f"{metadata.get('id', 'video')}.{language}.{marker}.{ext}"
-    payload = _read_url_bytes_with_retry(str(url))
+    payload = _read_url_bytes_with_retry(
+        str(url),
+        progress_callback=progress_callback,
+        phase="transcript",
+        retry_message="Metadata subtitle fetch stalled",
+    )
     subtitle_path.parent.mkdir(parents=True, exist_ok=True)
     subtitle_path.write_bytes(payload)
     return subtitle_path
@@ -1563,6 +1589,9 @@ def _read_url_bytes_with_retry(
     url: str,
     *,
     attempts: int = constants.DEFAULT_REMOTE_SUBTITLE_RETRY_ATTEMPTS,
+    progress_callback: Callable[[str, str], None] | None = None,
+    phase: str = "transcript",
+    retry_message: str = "Remote fetch stalled",
 ) -> bytes:
     total_attempts = max(1, attempts)
     last_error: Exception | None = None
@@ -1572,6 +1601,7 @@ def _read_url_bytes_with_retry(
                 return response.read()
         except Exception as exc:
             last_error = exc
+            _retry_message(progress_callback, phase, retry_message, attempt, total_attempts)
             if attempt < total_attempts:
                 time.sleep(constants.DEFAULT_YTDLP_RETRY_SLEEP_SECONDS)
     assert last_error is not None
@@ -1587,7 +1617,7 @@ def fetch_youtube_metadata(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": constants.DEFAULT_YTDLP_METADATA_SOCKET_TIMEOUT_SECONDS,
     }
     return _run_yt_dlp_extract_info(
         opts,
@@ -1599,12 +1629,17 @@ def fetch_youtube_metadata(
     )
 
 
-def download_youtube_subtitles(url: str, paths: AnalysisPaths) -> None:
+def download_youtube_subtitles(
+    url: str,
+    paths: AnalysisPaths,
+    *,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> None:
     subtitle_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": constants.DEFAULT_YTDLP_MEDIA_SOCKET_TIMEOUT_SECONDS,
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": False,
@@ -1618,6 +1653,7 @@ def download_youtube_subtitles(url: str, paths: AnalysisPaths) -> None:
         subtitle_opts,
         url,
         download=True,
+        progress_callback=progress_callback,
         phase="transcript",
         retry_message="Subtitle download stalled",
     )
@@ -1630,32 +1666,47 @@ def download_youtube_media(
     metadata_hint: dict[str, Any] | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> tuple[dict[str, Any], Path]:
+    report_progress(progress_callback, "transcript", "Fetching subtitle tracks")
     try:
-        download_youtube_subtitles(url, paths)
+        download_youtube_subtitles(url, paths, progress_callback=progress_callback)
     except Exception:
         # Subtitle retrieval is best-effort. If YouTube rate limits or rejects
         # caption download, keep the pipeline alive and allow later fallback to
         # Whisper after the video is downloaded.
         if metadata_hint is not None:
             try:
-                download_subtitle_from_metadata(metadata_hint, paths, source_url=url)
+                report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
+                download_subtitle_from_metadata(
+                    metadata_hint,
+                    paths,
+                    source_url=url,
+                    progress_callback=progress_callback,
+                )
             except Exception:
                 pass
     if choose_subtitle_file(paths.subtitles_dir) is None and metadata_hint is not None:
         try:
-            download_subtitle_from_metadata(metadata_hint, paths, source_url=url)
+            report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
+            download_subtitle_from_metadata(
+                metadata_hint,
+                paths,
+                source_url=url,
+                progress_callback=progress_callback,
+            )
         except Exception:
             pass
     video_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": constants.DEFAULT_YTDLP_MEDIA_SOCKET_TIMEOUT_SECONDS,
         "merge_output_format": "mp4",
+        "progress_hooks": [make_download_progress_hook(progress_callback)],
         "outtmpl": {
             "default": str(paths.video_dir / "source.%(ext)s"),
         },
     }
+    report_progress(progress_callback, "download", "Starting source media download")
     info = _run_yt_dlp_extract_info(
         video_opts,
         url,
@@ -1666,7 +1717,13 @@ def download_youtube_media(
     )
     if choose_subtitle_file(paths.subtitles_dir) is None:
         try:
-            download_subtitle_from_metadata(info, paths, source_url=url)
+            report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
+            download_subtitle_from_metadata(
+                info,
+                paths,
+                source_url=url,
+                progress_callback=progress_callback,
+            )
         except Exception:
             pass
     write_json(paths.metadata_path, info)
@@ -1839,7 +1896,6 @@ def analyze_source(
         if looks_like_url(source):
             metadata = metadata_hint or fetch_youtube_metadata(source, progress_callback=progress_callback)
             write_json(paths.metadata_path, metadata)
-            report_progress(progress_callback, "download", "Downloading source media")
             metadata, video_path = download_youtube_media(
                 source,
                 paths,

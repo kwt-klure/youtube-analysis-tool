@@ -52,6 +52,7 @@ from youtube_analysis_tool.pipeline import (
     transcript_from_segments,
     is_effective_burned_subtitle_text,
 )
+from youtube_analysis_tool import constants
 
 
 class SubtitleParsingTests(unittest.TestCase):
@@ -1061,7 +1062,10 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertEqual(2, attempts["count"])
         self.assertEqual("metadata", events[-1][0])
         self.assertIn("retrying (2/2)", events[-1][1])
-        self.assertIn("socket_timeout", captured["opts"])
+        self.assertEqual(
+            constants.DEFAULT_YTDLP_METADATA_SOCKET_TIMEOUT_SECONDS,
+            captured["opts"]["socket_timeout"],
+        )
 
     def test_download_youtube_media_continues_when_subtitle_download_fails(self) -> None:
         class FakeYoutubeDL:
@@ -1179,10 +1183,13 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
     def test_download_youtube_media_retries_download_once_then_succeeds(self) -> None:
         download_attempts = {"count": 0}
         events = []
+        video_opts = {}
 
         class FakeYoutubeDL:
             def __init__(self, opts):
                 self.opts = opts
+                if "default" in self.opts.get("outtmpl", {}):
+                    video_opts.update(opts)
 
             def __enter__(self):
                 return self
@@ -1197,10 +1204,14 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
                 download_attempts["count"] += 1
                 if download_attempts["count"] == 1:
                     raise RuntimeError("download stalled")
+                for hook in self.opts.get("progress_hooks", []):
+                    hook({"status": "downloading"})
                 default_template = self.opts["outtmpl"]["default"]
                 video_path = Path(default_template.replace("%(ext)s", "mp4"))
                 video_path.parent.mkdir(parents=True, exist_ok=True)
                 video_path.write_bytes(b"video")
+                for hook in self.opts.get("progress_hooks", []):
+                    hook({"status": "finished"})
                 return {"id": "demo-video"}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1221,8 +1232,59 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
             self.assertTrue(video_path.exists())
 
         self.assertEqual(2, download_attempts["count"])
-        self.assertEqual("download", events[-1][0])
-        self.assertIn("retrying (2/2)", events[-1][1])
+        self.assertEqual(("transcript", "Fetching subtitle tracks"), events[0])
+        self.assertTrue(any(message == "Starting source media download" for _, message in events))
+        self.assertTrue(any(phase == "download" and "Media transfer finished" in message for phase, message in events))
+        self.assertTrue(any("retrying (2/2)" in message for _, message in events))
+        self.assertTrue(any("Media transfer started" in message for _, message in events))
+        self.assertEqual(
+            constants.DEFAULT_YTDLP_MEDIA_SOCKET_TIMEOUT_SECONDS,
+            video_opts["socket_timeout"],
+        )
+
+    def test_download_youtube_media_reports_metadata_subtitle_fallback_before_download(self) -> None:
+        events = []
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                if self.opts.get("skip_download"):
+                    raise RuntimeError("subtitle fetch failed")
+                for hook in self.opts.get("progress_hooks", []):
+                    hook({"status": "downloading"})
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                for hook in self.opts.get("progress_hooks", []):
+                    hook({"status": "finished"})
+                return {"id": "demo-video"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL), mock.patch(
+                "youtube_analysis_tool.pipeline.download_subtitle_from_metadata",
+                return_value=None,
+            ):
+                download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    metadata_hint={"id": "demo-video"},
+                    progress_callback=lambda phase, message: events.append((phase, message)),
+                )
+
+        self.assertIn(("transcript", "Trying metadata subtitle fallback"), events)
+        self.assertIn(("download", "Starting source media download"), events)
 
     def test_download_subtitle_from_metadata_uses_timeout_and_retry(self) -> None:
         call_timeouts = []
