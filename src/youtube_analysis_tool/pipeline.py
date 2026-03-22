@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -458,13 +459,13 @@ def download_selected_subtitle_track(
     language: str,
     ext: str,
 ) -> Path | None:
-    YoutubeDL = load_yt_dlp()
     marker = subtitle_bucket_marker(bucket_name)
     before = {path.name for path in paths.subtitles_dir.glob("*")}
     subtitle_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
         "skip_download": True,
         "writesubtitles": bucket_name == "subtitles",
         "writeautomaticsub": bucket_name == "automatic_captions",
@@ -474,8 +475,13 @@ def download_selected_subtitle_track(
             "subtitle": str(paths.subtitles_dir / f"%(id)s.%(language)s.{marker}.%(ext)s"),
         },
     }
-    with YoutubeDL(subtitle_opts) as ydl:
-        ydl.extract_info(source_url, download=True)
+    _run_yt_dlp_extract_info(
+        subtitle_opts,
+        source_url,
+        download=True,
+        phase="transcript",
+        retry_message="Subtitle track fetch stalled",
+    )
     after = {
         path.name
         for path in paths.subtitles_dir.glob("*")
@@ -516,8 +522,7 @@ def download_subtitle_from_metadata(
         return None
     marker = subtitle_bucket_marker(bucket_name)
     subtitle_path = paths.subtitles_dir / f"{metadata.get('id', 'video')}.{language}.{marker}.{ext}"
-    with urlopen(str(url)) as response:
-        payload = response.read()
+    payload = _read_url_bytes_with_retry(str(url))
     subtitle_path.parent.mkdir(parents=True, exist_ok=True)
     subtitle_path.write_bytes(payload)
     return subtitle_path
@@ -1516,18 +1521,90 @@ def load_yt_dlp():
     return YoutubeDL
 
 
-def fetch_youtube_metadata(url: str) -> dict[str, Any]:
+def _retry_message(
+    progress_callback: Callable[[str, str], None] | None,
+    phase: str,
+    message: str,
+    attempt: int,
+    attempts: int,
+) -> None:
+    if progress_callback is None or attempt >= attempts:
+        return
+    report_progress(progress_callback, phase, f"{message}; retrying ({attempt + 1}/{attempts})")
+
+
+def _run_yt_dlp_extract_info(
+    opts: dict[str, Any],
+    url: str,
+    *,
+    download: bool,
+    attempts: int = constants.DEFAULT_YTDLP_RETRY_ATTEMPTS,
+    progress_callback: Callable[[str, str], None] | None = None,
+    phase: str = "metadata",
+    retry_message: str = "yt-dlp request failed",
+) -> dict[str, Any]:
     YoutubeDL = load_yt_dlp()
-    with YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-        return ydl.extract_info(url, download=False)
+    total_attempts = max(1, attempts)
+    last_error: Exception | None = None
+    for attempt in range(1, total_attempts + 1):
+        try:
+            with YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=download)
+        except Exception as exc:
+            last_error = exc
+            _retry_message(progress_callback, phase, retry_message, attempt, total_attempts)
+            if attempt < total_attempts:
+                time.sleep(constants.DEFAULT_YTDLP_RETRY_SLEEP_SECONDS)
+    assert last_error is not None
+    raise last_error
+
+
+def _read_url_bytes_with_retry(
+    url: str,
+    *,
+    attempts: int = constants.DEFAULT_REMOTE_SUBTITLE_RETRY_ATTEMPTS,
+) -> bytes:
+    total_attempts = max(1, attempts)
+    last_error: Exception | None = None
+    for attempt in range(1, total_attempts + 1):
+        try:
+            with urlopen(str(url), timeout=constants.DEFAULT_REMOTE_SUBTITLE_TIMEOUT_SECONDS) as response:
+                return response.read()
+        except Exception as exc:
+            last_error = exc
+            if attempt < total_attempts:
+                time.sleep(constants.DEFAULT_YTDLP_RETRY_SLEEP_SECONDS)
+    assert last_error is not None
+    raise last_error
+
+
+def fetch_youtube_metadata(
+    url: str,
+    *,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
+    }
+    return _run_yt_dlp_extract_info(
+        opts,
+        url,
+        download=False,
+        progress_callback=progress_callback,
+        phase="metadata",
+        retry_message="YouTube metadata fetch stalled",
+    )
 
 
 def download_youtube_subtitles(url: str, paths: AnalysisPaths) -> None:
-    YoutubeDL = load_yt_dlp()
     subtitle_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": False,
@@ -1537,8 +1614,13 @@ def download_youtube_subtitles(url: str, paths: AnalysisPaths) -> None:
             "subtitle": str(paths.subtitles_dir / "%(id)s.%(language)s.manual.%(ext)s"),
         },
     }
-    with YoutubeDL(subtitle_opts) as ydl:
-        ydl.extract_info(url, download=True)
+    _run_yt_dlp_extract_info(
+        subtitle_opts,
+        url,
+        download=True,
+        phase="transcript",
+        retry_message="Subtitle download stalled",
+    )
 
 
 def download_youtube_media(
@@ -1546,8 +1628,8 @@ def download_youtube_media(
     paths: AnalysisPaths,
     *,
     metadata_hint: dict[str, Any] | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    YoutubeDL = load_yt_dlp()
     try:
         download_youtube_subtitles(url, paths)
     except Exception:
@@ -1568,13 +1650,20 @@ def download_youtube_media(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": constants.DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS,
         "merge_output_format": "mp4",
         "outtmpl": {
             "default": str(paths.video_dir / "source.%(ext)s"),
         },
     }
-    with YoutubeDL(video_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = _run_yt_dlp_extract_info(
+        video_opts,
+        url,
+        download=True,
+        progress_callback=progress_callback,
+        phase="download",
+        retry_message="YouTube media download stalled",
+    )
     if choose_subtitle_file(paths.subtitles_dir) is None:
         try:
             download_subtitle_from_metadata(info, paths, source_url=url)
@@ -1654,6 +1743,11 @@ def create_keyframes(
 
 
 def write_empty_stage_artifacts(paths: AnalysisPaths) -> None:
+    paths.triage_frames_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.triage_segments_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.review_queue_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.review_decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.routing_manifest_path.parent.mkdir(parents=True, exist_ok=True)
     paths.triage_frames_path.write_text("", encoding="utf-8")
     write_json(paths.triage_segments_path, {"segments": []})
     write_json(paths.review_queue_path, {"queue": []})
@@ -1720,7 +1814,7 @@ def analyze_source(
     metadata_hint: dict[str, Any] | None = None
     if looks_like_url(source):
         report_progress(progress_callback, "metadata", "Fetching YouTube metadata")
-        metadata_hint = fetch_youtube_metadata(source)
+        metadata_hint = fetch_youtube_metadata(source, progress_callback=progress_callback)
     output_root = out_dir or default_output_dir_for_source(
         source,
         (metadata_hint or {}).get("id"),
@@ -1743,10 +1837,15 @@ def analyze_source(
 
     try:
         if looks_like_url(source):
-            metadata = metadata_hint or fetch_youtube_metadata(source)
+            metadata = metadata_hint or fetch_youtube_metadata(source, progress_callback=progress_callback)
             write_json(paths.metadata_path, metadata)
             report_progress(progress_callback, "download", "Downloading source media")
-            metadata, video_path = download_youtube_media(source, paths, metadata_hint=metadata)
+            metadata, video_path = download_youtube_media(
+                source,
+                paths,
+                metadata_hint=metadata,
+                progress_callback=progress_callback,
+            )
             audio_input = video_path
         else:
             if not source_path.exists():

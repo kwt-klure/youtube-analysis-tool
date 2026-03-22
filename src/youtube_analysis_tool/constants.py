@@ -21,7 +21,7 @@ SUBTITLE_LANGUAGE_PREFERENCE = (
 YOUTUBE_HOST_MARKERS = ("youtube.com", "youtu.be", "m.youtube.com")
 
 DEFAULT_TRIAGE_MODE = "on"
-DEFAULT_VISUALS_MODE = "on"
+DEFAULT_VISUALS_MODE = "off"
 DEFAULT_OCR_MODE = "auto"
 DEFAULT_BURNED_SUBTITLES_MODE = "off"
 DEFAULT_GPT_MODE = "off"
@@ -29,6 +29,12 @@ DEFAULT_REVIEW_MODE = "interactive"
 DEFAULT_GPT_MODEL = "gpt-5.4"
 DEFAULT_REPORT_LANGUAGE = "zh-TW"
 DEFAULT_ARTIFACTS_MODE = "minimal"
+
+DEFAULT_YTDLP_SOCKET_TIMEOUT_SECONDS = 15.0
+DEFAULT_YTDLP_RETRY_ATTEMPTS = 2
+DEFAULT_YTDLP_RETRY_SLEEP_SECONDS = 1.0
+DEFAULT_REMOTE_SUBTITLE_TIMEOUT_SECONDS = 15.0
+DEFAULT_REMOTE_SUBTITLE_RETRY_ATTEMPTS = 2
 
 # These defaults are intentionally provisional. They are centralized here so
 # calibration can tune them later without rewriting the rule logic.

@@ -62,12 +62,11 @@ If you open the JSON yourself, it may feel dense or ugly. That is expected.
 Running `youtube-analyze --source ...` with no extra flags:
 
 - keeps `--gpt off`
-- keeps `--visuals on`
+- keeps `--visuals off`
 - keeps `--artifacts minimal`
 - writes `output/youtube/<title-id-or-stem>/output.json`
 - preserves the full transcript inline
-- embeds retained visual evidence inline under `visuals.slides` and `visuals.charts`
-- keeps one inline primary image per retained visual item in minimal mode
+- skips the visual pipeline unless you explicitly opt in with `--visuals on`
 - cleans up large intermediate files after the run
 
 `output.json` is the canonical durable artifact. In minimal mode it is
@@ -162,6 +161,13 @@ Skip the entire visual pipeline for transcript-only runs:
 youtube-analyze --source /path/to/video.mp4 --visuals off
 ```
 
+Opt in to retained visuals when you actually want keyframes, frame OCR, and
+local triage:
+
+```bash
+youtube-analyze --source /path/to/video.mp4 --visuals on
+```
+
 Force a fully local transcript path when subtitles are available:
 
 ```bash
@@ -201,7 +207,7 @@ all visual work.
 ### Normal Local-First Run
 
 ```bash
-youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
+youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --visuals on
 ```
 
 This keeps transcript plus retained visuals in a single AI-facing bundle.
@@ -273,6 +279,9 @@ go through local Whisper.
 ## Visual Pipeline
 
 The visual pipeline is separate from transcript resolution.
+
+The default is `--visuals off`. Opt in with `--visuals on` when the visual
+layer is worth the extra local cost for that run.
 
 With `--visuals on`, the tool may:
 

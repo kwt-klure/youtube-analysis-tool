@@ -30,10 +30,12 @@ from youtube_analysis_tool.pipeline import (
     choose_subtitle_track_from_metadata,
     default_ocr_state,
     default_output_dir_for_source,
+    download_subtitle_from_metadata,
     download_youtube_media,
     download_youtube_subtitles,
     duration_seconds,
     extract_interval_keyframes,
+    fetch_youtube_metadata,
     find_dotenv_path,
     load_dotenv_file,
     load_local_env,
@@ -213,7 +215,7 @@ class CliArgumentTests(unittest.TestCase):
     def test_new_cli_flags_have_expected_defaults(self) -> None:
         args = parse_args(["--source", "/tmp/demo.mp4"])
 
-        self.assertEqual("on", args.visuals)
+        self.assertEqual("off", args.visuals)
         self.assertEqual("auto", args.ocr)
         self.assertEqual("off", args.burned_subtitles)
         self.assertEqual("on", args.triage)
@@ -891,6 +893,21 @@ class VisualsModeTests(unittest.TestCase):
         self.assertEqual([], written["visuals"]["slides"])
         self.assertEqual([], written["visuals"]["charts"])
 
+    def test_write_empty_stage_artifacts_creates_missing_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "out"
+            paths = analysis_paths(output_root)
+
+            from youtube_analysis_tool.pipeline import write_empty_stage_artifacts
+
+            write_empty_stage_artifacts(paths)
+
+            self.assertTrue(paths.triage_frames_path.exists())
+            self.assertTrue(paths.triage_segments_path.exists())
+            self.assertTrue(paths.review_queue_path.exists())
+            self.assertTrue(paths.review_decisions_path.exists())
+            self.assertTrue(paths.routing_manifest_path.exists())
+
 
 class YoutubeDownloadFallbackTests(unittest.TestCase):
     def test_preferred_subtitle_languages_follow_constants(self) -> None:
@@ -1007,6 +1024,44 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertFalse(opts["writeautomaticsub"])
         self.assertEqual(preferred_subtitle_languages(), opts["subtitleslangs"])
         self.assertIn(".manual.", opts["outtmpl"]["subtitle"])
+        self.assertIn("socket_timeout", opts)
+
+    def test_fetch_youtube_metadata_retries_once_then_succeeds(self) -> None:
+        attempts = {"count": 0}
+        events = []
+        captured = {}
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                captured["opts"] = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("metadata stalled")
+                return {"id": "demo-video"}
+
+        with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL), mock.patch(
+            "youtube_analysis_tool.pipeline.time.sleep",
+            return_value=None,
+        ):
+            metadata = fetch_youtube_metadata(
+                "https://youtu.be/demo",
+                progress_callback=lambda phase, message: events.append((phase, message)),
+            )
+
+        self.assertEqual("demo-video", metadata["id"])
+        self.assertEqual(2, attempts["count"])
+        self.assertEqual("metadata", events[-1][0])
+        self.assertIn("retrying (2/2)", events[-1][1])
+        self.assertIn("socket_timeout", captured["opts"])
 
     def test_download_youtube_media_continues_when_subtitle_download_fails(self) -> None:
         class FakeYoutubeDL:
@@ -1120,6 +1175,96 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
             self.assertTrue(video_path.exists())
             subtitle_path = paths.subtitles_dir / "demo-video.zh-Hant.auto.vtt"
             self.assertTrue(subtitle_path.exists())
+
+    def test_download_youtube_media_retries_download_once_then_succeeds(self) -> None:
+        download_attempts = {"count": 0}
+        events = []
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                if self.opts.get("skip_download"):
+                    return {}
+                download_attempts["count"] += 1
+                if download_attempts["count"] == 1:
+                    raise RuntimeError("download stalled")
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                return {"id": "demo-video"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL), mock.patch(
+                "youtube_analysis_tool.pipeline.time.sleep",
+                return_value=None,
+            ):
+                info, video_path = download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    metadata_hint={"id": "demo-video"},
+                    progress_callback=lambda phase, message: events.append((phase, message)),
+                )
+
+            self.assertEqual("demo-video", info["id"])
+            self.assertTrue(video_path.exists())
+
+        self.assertEqual(2, download_attempts["count"])
+        self.assertEqual("download", events[-1][0])
+        self.assertIn("retrying (2/2)", events[-1][1])
+
+    def test_download_subtitle_from_metadata_uses_timeout_and_retry(self) -> None:
+        call_timeouts = []
+
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return self.payload
+
+        def fake_urlopen(url, timeout=None):
+            call_timeouts.append(timeout)
+            if len(call_timeouts) == 1:
+                raise RuntimeError("temporary timeout")
+            return FakeResponse(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            metadata = {
+                "id": "demo-video",
+                "subtitles": {
+                    "zh-TW": [{"ext": "vtt", "url": "https://example.com/demo.vtt"}]
+                },
+            }
+            with mock.patch("youtube_analysis_tool.pipeline.urlopen", side_effect=fake_urlopen), mock.patch(
+                "youtube_analysis_tool.pipeline.time.sleep",
+                return_value=None,
+            ):
+                subtitle_path = download_subtitle_from_metadata(metadata, paths)
+
+            self.assertIsNotNone(subtitle_path)
+            self.assertTrue(subtitle_path.exists())
+
+        self.assertEqual(2, len(call_timeouts))
+        self.assertTrue(all(timeout is not None for timeout in call_timeouts))
 
 
 class CleanupTests(unittest.TestCase):
