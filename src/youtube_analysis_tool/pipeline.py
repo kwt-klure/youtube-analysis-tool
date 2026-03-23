@@ -429,11 +429,9 @@ def subtitle_bucket_marker(bucket_name: str | None) -> str:
     return "manual"
 
 
-def subtitle_translation_rank(bucket_name: str | None, item: dict[str, Any]) -> int:
-    if bucket_name != "automatic_captions":
-        return 0
+def is_translated_subtitle_track(item: dict[str, Any]) -> bool:
     url = str(item.get("url") or "")
-    return 1 if "tlang=" in url else 0
+    return "tlang=" in url
 
 
 def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
@@ -450,19 +448,20 @@ def choose_subtitle_file(subtitles_dir: Path) -> Path | None:
 
 
 def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
-    candidates: list[tuple[int, int, int, int, str, str, dict[str, Any]]] = []
+    candidates: list[tuple[int, int, int, str, str, dict[str, Any]]] = []
     allowed_extensions = {"vtt", "srt", "json3", "ttml", "srv3", "srv2", "srv1"}
     for bucket_name in ("subtitles", "automatic_captions"):
         bucket = metadata.get(bucket_name) or {}
         for language, items in bucket.items():
             for item in items:
+                if is_translated_subtitle_track(item):
+                    continue
                 ext = str(item.get("ext", "")).lower()
                 if ext not in allowed_extensions:
                     continue
                 candidates.append(
                     (
                         subtitle_bucket_rank(bucket_name),
-                        subtitle_translation_rank(bucket_name, item),
                         subtitle_language_rank(language),
                         subtitle_ext_rank(ext),
                         bucket_name,
@@ -472,7 +471,7 @@ def choose_subtitle_track_from_metadata(metadata: dict[str, Any]) -> tuple[str, 
                 )
     if not candidates:
         return None
-    _, _, _, _, bucket_name, language, item = sorted(candidates, key=lambda row: row[:4])[0]
+    _, _, _, bucket_name, language, item = sorted(candidates, key=lambda row: row[:3])[0]
     return bucket_name, language, item
 
 

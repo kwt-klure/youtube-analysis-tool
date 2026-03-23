@@ -268,6 +268,8 @@ Important details:
 
 - if any usable subtitle track exists, it wins over Whisper
 - language preference affects ordering, but any usable subtitle beats Whisper
+- YouTube auto-translated subtitle tracks are treated as unusable by default;
+  if only translated tracks exist, the tool falls back to original-audio ASR
 - burned subtitle OCR is local, conservative, and opt-in by default
 - if you enable it, it is allowed to fail fast and fall back
 - if subtitles satisfy transcript resolution, the tool skips audio extraction

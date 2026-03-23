@@ -993,6 +993,36 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertEqual("ja", language)
         self.assertEqual("json3", item["ext"])
 
+    def test_choose_subtitle_track_from_metadata_accepts_nonpreferred_manual_language_when_only_option(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "subtitles": {
+                    "cs": [{"ext": "vtt", "url": "https://example.com/cs.vtt"}]
+                }
+            }
+        )
+
+        self.assertIsNotNone(selection)
+        bucket_name, language, item = selection
+        self.assertEqual("subtitles", bucket_name)
+        self.assertEqual("cs", language)
+        self.assertEqual("vtt", item["ext"])
+
+    def test_choose_subtitle_track_from_metadata_accepts_nonpreferred_auto_language_when_only_option(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "automatic_captions": {
+                    "cs": [{"ext": "json3", "url": "https://example.com/cs.json3"}]
+                }
+            }
+        )
+
+        self.assertIsNotNone(selection)
+        bucket_name, language, item = selection
+        self.assertEqual("automatic_captions", bucket_name)
+        self.assertEqual("cs", language)
+        self.assertEqual("json3", item["ext"])
+
     def test_choose_subtitle_track_from_metadata_prefers_original_auto_caption_before_translated(self) -> None:
         selection = choose_subtitle_track_from_metadata(
             {
@@ -1018,6 +1048,38 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
         self.assertEqual("automatic_captions", bucket_name)
         self.assertEqual("ja", language)
         self.assertNotIn("tlang=", item["url"])
+
+    def test_choose_subtitle_track_from_metadata_rejects_translated_auto_caption_when_it_is_only_option(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "automatic_captions": {
+                    "zh-Hant": [
+                        {
+                            "ext": "vtt",
+                            "url": "https://example.com/caption.vtt?tlang=zh-Hant&lang=ja",
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertIsNone(selection)
+
+    def test_choose_subtitle_track_from_metadata_rejects_translated_subtitles_bucket_track(self) -> None:
+        selection = choose_subtitle_track_from_metadata(
+            {
+                "subtitles": {
+                    "en": [
+                        {
+                            "ext": "vtt",
+                            "url": "https://example.com/caption.vtt?tlang=en&lang=ja",
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertIsNone(selection)
 
     def test_download_youtube_subtitles_uses_narrow_official_subtitle_policy(self) -> None:
         captured = {}
@@ -1200,6 +1262,107 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
             self.assertTrue(video_path.exists())
             subtitle_path = paths.subtitles_dir / "demo-video.zh-Hant.auto.vtt"
             self.assertTrue(subtitle_path.exists())
+
+    def test_download_youtube_media_falls_back_to_post_download_info_for_nonpreferred_auto_caption_language(self) -> None:
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                if self.opts.get("skip_download"):
+                    return {}
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                return {
+                    "id": "demo-video",
+                    "automatic_captions": {
+                        "cs": [{"ext": "vtt", "url": "https://example.com/cs-auto.vtt"}]
+                    },
+                }
+
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return self.payload
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL), mock.patch(
+                "youtube_analysis_tool.pipeline.urlopen",
+                return_value=FakeResponse(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nahoj\n"),
+            ):
+                info, video_path = download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    metadata_hint={"id": "demo-video"},
+                )
+            self.assertEqual("demo-video", info["id"])
+            self.assertTrue(video_path.exists())
+            subtitle_path = paths.subtitles_dir / "demo-video.cs.auto.vtt"
+            self.assertTrue(subtitle_path.exists())
+
+    def test_download_youtube_media_ignores_translated_auto_captions_in_post_download_info(self) -> None:
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                if self.opts.get("skip_download"):
+                    return {}
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                return {
+                    "id": "demo-video",
+                    "automatic_captions": {
+                        "zh-Hant": [
+                            {
+                                "ext": "vtt",
+                                "url": "https://example.com/translated.vtt?tlang=zh-Hant&lang=ja",
+                            }
+                        ]
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL):
+                info, video_path = download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    metadata_hint={"id": "demo-video"},
+                )
+
+            self.assertEqual("demo-video", info["id"])
+            self.assertTrue(video_path.exists())
+            self.assertFalse(any(paths.subtitles_dir.glob("*")))
 
     def test_download_youtube_media_retries_download_once_then_succeeds(self) -> None:
         download_attempts = {"count": 0}
