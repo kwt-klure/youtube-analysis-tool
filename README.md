@@ -316,7 +316,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.4",
+  "output_version": "1.0.5",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -335,7 +335,7 @@ Small truncated example:
 
 ```json
 {
-  "output_version": "1.0.4",
+  "output_version": "1.0.5",
   "source": {
     "kind": "youtube",
     "input": "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -363,6 +363,10 @@ Small truncated example:
       "quality_notes": [
         "text_track_subtitles"
       ]
+    },
+    "interpretation": {
+      "trust": "medium_low",
+      "caution": ["names", "numbers", "exact_wording"]
     }
   },
   "visuals": {
@@ -425,6 +429,7 @@ minimal mode.
 - `segments`
 - `segment_count`
 - `provenance`
+- `interpretation` when the source needs extra reading caution
 
 This is intentionally redundant from a human perspective. Another model usually
 benefits from having both:
@@ -479,6 +484,14 @@ Fields here include things like:
 Manual subtitles, YouTube auto captions, burned subtitle OCR, and Whisper do
 not have the same confidence profile. The bundle tries to say that explicitly
 instead of pretending every transcript source is equal.
+
+When a lower-trust transcript source needs extra caution, the bundle may add a
+small `transcript.interpretation` object. This is intentionally sparse and
+AI-facing: it is not extra metadata, but a compact hint about how aggressively
+another model should trust names, numbers, and exact wording. When needed, it
+may also include a couple of short quality signals such as rolling-caption
+overlap or heavy fragmentation. Direct text-track subtitles in the
+`subtitle_manual` path stay unannotated by default.
 
 ## Artifact Modes
 

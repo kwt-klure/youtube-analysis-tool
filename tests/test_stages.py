@@ -333,6 +333,7 @@ class OutputBundleTests(unittest.TestCase):
         self.assertEqual("Revenue is up.", written["transcript"]["full_text"])
         self.assertEqual(1, len(written["transcript"]["segments"]))
         self.assertEqual(1, written["transcript"]["segment_count"])
+        self.assertNotIn("interpretation", written["transcript"])
         self.assertEqual("text_track", written["transcript"]["provenance"]["extraction_kind"])
         self.assertEqual(1, len(written["visuals"]["slides"]))
         self.assertEqual("base64", written["visuals"]["slides"][0]["images"][0]["encoding"])
@@ -393,6 +394,149 @@ class OutputBundleTests(unittest.TestCase):
         self.assertEqual("gpt-5.4", payload["gpt"]["model"])
         self.assertEqual("影片分析報告", payload["gpt"]["final_report"]["title"])
 
+    def test_output_json_adds_sparse_interpretation_for_auto_captions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = pipeline.analysis_paths(root)
+
+            payload = reporting.write_output_file(
+                paths,
+                source_input="https://youtu.be/demo",
+                is_url=True,
+                is_youtube_url=True,
+                metadata={"id": "demo", "title": "Demo"},
+                transcript={
+                    "source": "subtitle_auto",
+                    "language": "ja-orig",
+                    "text": "第一段字幕",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "第一段字幕"}],
+                },
+                ocr={"mode": "off", "status": "skipped", "attempted": False, "frame_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                visuals_payload={"slides": [], "charts": []},
+                errors=[],
+                cleanup_intermediates=True,
+                transcript_mode="auto",
+                visuals_mode="off",
+                ocr_mode="off",
+                gpt_mode="off",
+                artifacts_mode="minimal",
+            )
+
+        self.assertEqual(
+            {"trust": "medium_low", "caution": ["names", "numbers", "exact_wording"]},
+            payload["transcript"]["interpretation"],
+        )
+
+    def test_output_json_adds_sparse_interpretation_for_whisper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = pipeline.analysis_paths(root)
+
+            payload = reporting.write_output_file(
+                paths,
+                source_input="/tmp/demo.mp4",
+                is_url=False,
+                is_youtube_url=False,
+                metadata={"id": "demo", "title": "Demo"},
+                transcript={
+                    "source": "whisper",
+                    "language": "zh",
+                    "text": "逐字稿內容",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "逐字稿內容"}],
+                },
+                ocr={"mode": "off", "status": "skipped", "attempted": False, "frame_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                visuals_payload={"slides": [], "charts": []},
+                errors=[],
+                cleanup_intermediates=True,
+                transcript_mode="whisper",
+                visuals_mode="off",
+                ocr_mode="off",
+                gpt_mode="off",
+                artifacts_mode="minimal",
+            )
+
+        self.assertEqual(
+            {"trust": "medium", "caution": ["names", "numbers", "exact_wording"]},
+            payload["transcript"]["interpretation"],
+        )
+
+    def test_output_json_downgrades_auto_caption_interpretation_when_overlap_is_heavy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = pipeline.analysis_paths(root)
+
+            payload = reporting.write_output_file(
+                paths,
+                source_input="https://youtu.be/demo",
+                is_url=True,
+                is_youtube_url=True,
+                metadata={"id": "demo", "title": "Demo"},
+                transcript={
+                    "source": "subtitle_auto",
+                    "language": "ja-orig",
+                    "text": "艦これアキネーターのリハです",
+                    "segments": [
+                        {"start": 0.0, "end": 1.0, "text": "艦これアキネーター"},
+                        {"start": 1.0, "end": 2.0, "text": "艦これアキネーターのリハ"},
+                        {"start": 2.0, "end": 3.0, "text": "艦これアキネーターのリハです"},
+                        {"start": 3.0, "end": 4.0, "text": "艦これアキネーターのリハです"},
+                    ],
+                },
+                ocr={"mode": "off", "status": "skipped", "attempted": False, "frame_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                visuals_payload={"slides": [], "charts": []},
+                errors=[],
+                cleanup_intermediates=True,
+                transcript_mode="auto",
+                visuals_mode="off",
+                ocr_mode="off",
+                gpt_mode="off",
+                artifacts_mode="minimal",
+            )
+
+        self.assertEqual("low", payload["transcript"]["interpretation"]["trust"])
+        self.assertEqual(
+            ["overlap_heavy", "duplicate_heavy"],
+            payload["transcript"]["interpretation"]["signals"],
+        )
+
+    def test_output_json_does_not_add_interpretation_for_noisy_manual_subtitles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = pipeline.analysis_paths(root)
+
+            payload = reporting.write_output_file(
+                paths,
+                source_input="https://youtu.be/demo",
+                is_url=True,
+                is_youtube_url=True,
+                metadata={"id": "demo", "title": "Demo"},
+                transcript={
+                    "source": "subtitle_manual",
+                    "language": "ja-orig",
+                    "text": "艦これアキネーターのリハです",
+                    "segments": [
+                        {"start": 0.0, "end": 1.0, "text": "艦これアキネーター"},
+                        {"start": 1.0, "end": 2.0, "text": "艦これアキネーターのリハ"},
+                        {"start": 2.0, "end": 3.0, "text": "艦これアキネーターのリハです"},
+                        {"start": 3.0, "end": 4.0, "text": "艦これアキネーターのリハです"},
+                    ],
+                },
+                ocr={"mode": "off", "status": "skipped", "attempted": False, "frame_count": 0, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                visuals_payload={"slides": [], "charts": []},
+                errors=[],
+                cleanup_intermediates=True,
+                transcript_mode="auto",
+                visuals_mode="off",
+                ocr_mode="off",
+                gpt_mode="off",
+                artifacts_mode="minimal",
+            )
+
+        self.assertNotIn("interpretation", payload["transcript"])
 
 class VisualPayloadTests(unittest.TestCase):
     def test_build_embedded_visuals_exports_only_slides_and_charts(self) -> None:

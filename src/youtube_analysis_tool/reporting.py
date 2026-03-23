@@ -134,6 +134,83 @@ def transcript_quality_notes(source: str | None) -> list[str]:
     return ["transcript_source_unknown"]
 
 
+def normalize_segment_text_for_quality(text: str) -> str:
+    return "".join(str(text or "").split()).casefold()
+
+
+def transcript_quality_signals(segments: list[dict[str, Any]] | None) -> list[str]:
+    texts = [
+        normalize_segment_text_for_quality(segment.get("text", ""))
+        for segment in segments or []
+    ]
+    texts = [text for text in texts if text]
+    if not texts:
+        return []
+
+    short_count = sum(1 for text in texts if len(text) <= 3)
+    duplicate_hits = 0
+    overlap_hits = 0
+    adjacent_pairs = max(0, len(texts) - 1)
+
+    for previous, current in zip(texts, texts[1:]):
+        if previous == current and len(current) >= 6:
+            duplicate_hits += 1
+            continue
+        shorter, longer = sorted((previous, current), key=len)
+        if len(shorter) >= 6 and shorter in longer:
+            overlap_hits += 1
+
+    signals: list[str] = []
+    if len(texts) >= 6 and short_count / len(texts) >= 0.45:
+        signals.append("fragmented")
+    if adjacent_pairs >= 3 and overlap_hits / adjacent_pairs >= 0.35:
+        signals.append("overlap_heavy")
+    if adjacent_pairs >= 3 and duplicate_hits / adjacent_pairs >= 0.2:
+        signals.append("duplicate_heavy")
+    return signals
+
+
+def downgrade_trust_level(value: str) -> str:
+    if value == "medium":
+        return "medium_low"
+    if value == "medium_low":
+        return "low"
+    return value
+
+
+def transcript_interpretation(transcript: dict[str, Any] | None) -> dict[str, Any] | None:
+    transcript = transcript or {}
+    source = str(transcript.get("source") or "")
+    if source in {"subtitle", "subtitle_manual"}:
+        return None
+    signals = transcript_quality_signals(transcript.get("segments"))
+
+    base_trust: str | None
+    if source == "subtitle_auto":
+        base_trust = "medium_low"
+    elif source in {"whisper", "openai"}:
+        base_trust = "medium"
+    elif source == "burned_subtitle_ocr":
+        base_trust = "low"
+    else:
+        base_trust = None
+
+    if base_trust is None and not signals:
+        return None
+
+    trust = base_trust or "medium_low"
+    if base_trust is not None and signals:
+        trust = downgrade_trust_level(trust)
+
+    interpretation = {
+        "trust": trust,
+        "caution": ["names", "numbers", "exact_wording"],
+    }
+    if signals:
+        interpretation["signals"] = signals
+    return interpretation
+
+
 def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[str, Any]:
     transcript = transcript or {}
     source = transcript.get("source")
@@ -148,7 +225,7 @@ def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[s
 
 def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
     transcript = transcript or {}
-    return {
+    normalized = {
         "source": transcript.get("source"),
         "language": transcript.get("language"),
         "full_text": transcript.get("text", ""),
@@ -156,6 +233,10 @@ def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
         "segment_count": transcript.get("segment_count", len(transcript.get("segments") or [])),
         "provenance": normalize_transcript_provenance(transcript),
     }
+    interpretation = transcript_interpretation(transcript)
+    if interpretation is not None:
+        normalized["interpretation"] = interpretation
+    return normalized
 
 
 def summarize_visual_bucket_provenance(items: list[dict[str, Any]]) -> dict[str, Any]:
