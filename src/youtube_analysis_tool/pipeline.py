@@ -362,15 +362,27 @@ def detect_language_from_filename(path: Path) -> str | None:
     suffixes = path.name.split(".")
     if len(suffixes) < 3:
         return None
-    if len(suffixes) >= 4 and suffixes[-2].lower() in {"manual", "auto"}:
-        return suffixes[-3].lower()
+    marker_index = None
+    for index in range(len(suffixes) - 2, 0, -1):
+        if suffixes[index].lower() in {"manual", "auto"}:
+            marker_index = index
+            break
+    if marker_index is not None:
+        if marker_index + 1 < len(suffixes) - 1:
+            return suffixes[marker_index + 1].lower()
+        if marker_index - 1 >= 1:
+            return suffixes[marker_index - 1].lower()
     return suffixes[-2].lower()
 
 
 def detect_subtitle_source_from_filename(path: Path) -> str:
     suffixes = path.name.split(".")
-    if len(suffixes) >= 4 and suffixes[-2].lower() == "auto":
-        return "subtitle_auto"
+    for index in range(len(suffixes) - 2, 0, -1):
+        token = suffixes[index].lower()
+        if token == "auto":
+            return "subtitle_auto"
+        if token == "manual":
+            return "subtitle_manual"
     return "subtitle_manual"
 
 

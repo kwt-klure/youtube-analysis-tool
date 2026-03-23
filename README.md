@@ -314,7 +314,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.3",
+  "output_version": "1.0.4",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -333,7 +333,7 @@ Small truncated example:
 
 ```json
 {
-  "output_version": "1.0.3",
+  "output_version": "1.0.4",
   "source": {
     "kind": "youtube",
     "input": "https://www.youtube.com/watch?v=VIDEO_ID"

@@ -115,6 +115,17 @@ class SubtitleParsingTests(unittest.TestCase):
         self.assertEqual("subtitle_auto", transcript["source"])
         self.assertEqual("ja", transcript["language"])
 
+    def test_transcript_from_auto_subtitles_with_translated_suffix_keeps_auto_source_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            subtitle_path = paths.subtitles_dir / "video.en-US.auto.en.vtt"
+            subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+            subtitle_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n", encoding="utf-8")
+            transcript = transcript_from_subtitles(subtitle_path, paths)
+
+        self.assertEqual("subtitle_auto", transcript["source"])
+        self.assertEqual("en", transcript["language"])
+
     def test_choose_subtitle_file_prefers_chinese_then_english(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -134,6 +145,16 @@ class SubtitleParsingTests(unittest.TestCase):
 
         self.assertIsNotNone(choice)
         self.assertEqual("video.ja.manual.vtt", choice.name)
+
+    def test_choose_subtitle_file_treats_translated_auto_suffix_as_auto(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "video.en-US.auto.en.vtt").write_text("", encoding="utf-8")
+            (root / "video.en.manual.vtt").write_text("", encoding="utf-8")
+            choice = choose_subtitle_file(root)
+
+        self.assertIsNotNone(choice)
+        self.assertEqual("video.en.manual.vtt", choice.name)
 
     def test_choose_subtitle_file_accepts_json3_when_no_vtt_or_srt_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
