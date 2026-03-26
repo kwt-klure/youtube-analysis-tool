@@ -178,6 +178,12 @@ def downgrade_trust_level(value: str) -> str:
     return value
 
 
+def transcript_read_mode(trust: str) -> str:
+    if trust == "low":
+        return "topic_only"
+    return "verify_entities"
+
+
 def transcript_interpretation(transcript: dict[str, Any] | None) -> dict[str, Any] | None:
     transcript = transcript or {}
     source = str(transcript.get("source") or "")
@@ -204,6 +210,7 @@ def transcript_interpretation(transcript: dict[str, Any] | None) -> dict[str, An
 
     interpretation = {
         "trust": trust,
+        "read_mode": transcript_read_mode(trust),
         "caution": ["names", "numbers", "exact_wording"],
     }
     if signals:

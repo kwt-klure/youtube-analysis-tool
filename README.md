@@ -316,7 +316,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.5",
+  "output_version": "1.0.6",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -335,7 +335,7 @@ Small truncated example:
 
 ```json
 {
-  "output_version": "1.0.5",
+  "output_version": "1.0.6",
   "source": {
     "kind": "youtube",
     "input": "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -366,6 +366,7 @@ Small truncated example:
     },
     "interpretation": {
       "trust": "medium_low",
+      "read_mode": "verify_entities",
       "caution": ["names", "numbers", "exact_wording"]
     }
   },
@@ -430,6 +431,7 @@ minimal mode.
 - `segment_count`
 - `provenance`
 - `interpretation` when the source needs extra reading caution
+  including a tiny `read_mode` such as `verify_entities` or `topic_only`
 
 This is intentionally redundant from a human perspective. Another model usually
 benefits from having both:
@@ -489,8 +491,9 @@ When a lower-trust transcript source needs extra caution, the bundle may add a
 small `transcript.interpretation` object. This is intentionally sparse and
 AI-facing: it is not extra metadata, but a compact hint about how aggressively
 another model should trust names, numbers, and exact wording. When needed, it
-may also include a couple of short quality signals such as rolling-caption
-overlap or heavy fragmentation. Direct text-track subtitles in the
+may also include a tiny `read_mode` and a couple of short quality signals such
+as rolling-caption overlap or heavy fragmentation. Direct text-track subtitles
+in the
 `subtitle_manual` path stay unannotated by default.
 
 ## Artifact Modes

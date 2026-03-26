@@ -424,7 +424,11 @@ class OutputBundleTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            {"trust": "medium_low", "caution": ["names", "numbers", "exact_wording"]},
+            {
+                "trust": "medium_low",
+                "read_mode": "verify_entities",
+                "caution": ["names", "numbers", "exact_wording"],
+            },
             payload["transcript"]["interpretation"],
         )
 
@@ -458,7 +462,11 @@ class OutputBundleTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            {"trust": "medium", "caution": ["names", "numbers", "exact_wording"]},
+            {
+                "trust": "medium",
+                "read_mode": "verify_entities",
+                "caution": ["names", "numbers", "exact_wording"],
+            },
             payload["transcript"]["interpretation"],
         )
 
@@ -497,6 +505,7 @@ class OutputBundleTests(unittest.TestCase):
             )
 
         self.assertEqual("low", payload["transcript"]["interpretation"]["trust"])
+        self.assertEqual("topic_only", payload["transcript"]["interpretation"]["read_mode"])
         self.assertEqual(
             ["overlap_heavy", "duplicate_heavy"],
             payload["transcript"]["interpretation"]["signals"],
