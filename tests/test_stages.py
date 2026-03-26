@@ -357,6 +357,10 @@ class OutputBundleTests(unittest.TestCase):
         self.assertFalse(written["processing"]["gpt_enabled"])
         self.assertEqual("direct_metadata_extract", written["provenance"]["metadata"]["extraction_kind"])
         self.assertTrue(written["provenance"]["transcript"]["is_direct_text_track"])
+        self.assertEqual(
+            "heuristic_segment_promotion",
+            written["provenance"]["visuals"]["selection_kind"],
+        )
         self.assertEqual(1, written["provenance"]["visuals"]["slides"]["count"])
         self.assertEqual(["segment-0001"], written["provenance"]["visuals"]["slides"]["segment_ids"])
         self.assertNotIn("gpt", written)
@@ -431,6 +435,14 @@ class OutputBundleTests(unittest.TestCase):
             },
             payload["transcript"]["interpretation"],
         )
+        self.assertEqual("skipped", payload["provenance"]["visuals"]["selection_kind"])
+        self.assertEqual(
+            [
+                "visual pipeline skipped because visuals_mode is off",
+                "no heuristic visual promotion was attempted",
+            ],
+            payload["provenance"]["visuals"]["quality_notes"],
+        )
 
     def test_output_json_adds_sparse_interpretation_for_whisper(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -469,6 +481,7 @@ class OutputBundleTests(unittest.TestCase):
             },
             payload["transcript"]["interpretation"],
         )
+        self.assertEqual("skipped", payload["provenance"]["visuals"]["selection_kind"])
 
     def test_output_json_downgrades_auto_caption_interpretation_when_overlap_is_heavy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

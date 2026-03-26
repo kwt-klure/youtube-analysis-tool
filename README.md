@@ -316,7 +316,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.6",
+  "output_version": "1.0.7",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -335,7 +335,7 @@ Small truncated example:
 
 ```json
 {
-  "output_version": "1.0.6",
+  "output_version": "1.0.7",
   "source": {
     "kind": "youtube",
     "input": "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -495,6 +495,9 @@ may also include a tiny `read_mode` and a couple of short quality signals such
 as rolling-caption overlap or heavy fragmentation. Direct text-track subtitles
 in the
 `subtitle_manual` path stay unannotated by default.
+
+When `visuals_mode` is `off`, `provenance.visuals.selection_kind` is marked as
+`skipped` so the bundle does not imply that heuristic visual promotion ran.
 
 ## Artifact Modes
 

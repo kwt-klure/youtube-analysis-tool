@@ -298,14 +298,11 @@ def summarize_provenance(
     *,
     transcript: dict[str, Any] | None,
     visuals_payload: dict[str, list[dict[str, Any]]],
+    visuals_mode: str,
 ) -> dict[str, Any]:
-    return {
-        "metadata": {
-            "extraction_kind": "direct_metadata_extract",
-            "quality_notes": [],
-        },
-        "transcript": normalize_transcript_provenance(transcript),
-        "visuals": {
+    visuals_provenance: dict[str, Any]
+    if visuals_mode == "on":
+        visuals_provenance = {
             "selection_kind": "heuristic_segment_promotion",
             "quality_notes": [
                 "visual labels are heuristic routing labels",
@@ -313,7 +310,24 @@ def summarize_provenance(
             ],
             "slides": summarize_visual_bucket_provenance(visuals_payload.get("slides", [])),
             "charts": summarize_visual_bucket_provenance(visuals_payload.get("charts", [])),
+        }
+    else:
+        visuals_provenance = {
+            "selection_kind": "skipped",
+            "quality_notes": [
+                f"visual pipeline skipped because visuals_mode is {visuals_mode}",
+                "no heuristic visual promotion was attempted",
+            ],
+            "slides": summarize_visual_bucket_provenance(visuals_payload.get("slides", [])),
+            "charts": summarize_visual_bucket_provenance(visuals_payload.get("charts", [])),
+        }
+    return {
+        "metadata": {
+            "extraction_kind": "direct_metadata_extract",
+            "quality_notes": [],
         },
+        "transcript": normalize_transcript_provenance(transcript),
+        "visuals": visuals_provenance,
     }
 
 
@@ -399,6 +413,7 @@ def build_output_payload(
         "provenance": summarize_provenance(
             transcript=transcript,
             visuals_payload=normalized_visuals,
+            visuals_mode=visuals_mode,
         ),
         "errors": errors,
     }
