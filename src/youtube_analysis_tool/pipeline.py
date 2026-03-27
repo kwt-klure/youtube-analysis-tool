@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.request import urlopen
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 
 from . import constants, gpt, reporting, review, routing, triage, visuals
@@ -118,6 +118,28 @@ def is_youtube_url(source: str) -> bool:
     return any(marker in host for marker in constants.YOUTUBE_HOST_MARKERS)
 
 
+def youtube_video_id_from_source(source: str) -> str | None:
+    if not is_youtube_url(source):
+        return None
+
+    parsed = urlparse(source)
+    host = parsed.netloc.lower()
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if host.endswith("youtu.be"):
+        return path_parts[0] if path_parts else None
+
+    query_video_id = parse_qs(parsed.query).get("v", [None])[0]
+    if query_video_id:
+        return query_video_id
+
+    for marker in ("shorts", "embed", "live"):
+        if len(path_parts) >= 2 and path_parts[0] == marker:
+            return path_parts[1]
+
+    return None
+
+
 def slugify(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(value or ""))
     chunks: list[str] = []
@@ -181,18 +203,20 @@ def default_output_dir_for_source(
     source: str,
     video_id: str | None = None,
     video_title: str | None = None,
+    output_root: Path | None = None,
 ) -> Path:
+    base_root = output_root or constants.DEFAULT_OUTPUT_ROOT
     if video_id:
         video_id_slug = slugify(video_id)
         raw_title = str(video_title or "").strip()
         title_slug = slugify(raw_title) if raw_title else ""
         if title_slug:
-            return constants.DEFAULT_OUTPUT_ROOT / f"{title_slug}-{video_id_slug}"
-        return constants.DEFAULT_OUTPUT_ROOT / video_id_slug
+            return base_root / f"{title_slug}-{video_id_slug}"
+        return base_root / video_id_slug
     if looks_like_url(source):
         digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
-        return constants.DEFAULT_OUTPUT_ROOT / f"url-{digest}"
-    return constants.DEFAULT_OUTPUT_ROOT / slugify(Path(source).stem)
+        return base_root / f"url-{digest}"
+    return base_root / slugify(Path(source).stem)
 
 
 def analysis_paths(root: Path) -> AnalysisPaths:
@@ -1864,6 +1888,7 @@ def analyze_source(
     ocr_mode: str = constants.DEFAULT_OCR_MODE,
     burned_subtitles_mode: str = constants.DEFAULT_BURNED_SUBTITLES_MODE,
     out_dir: Path | None = None,
+    output_root_base: Path | None = None,
     interval_seconds: int = constants.DEFAULT_INTERVAL_SECONDS,
     scene_threshold: float = constants.DEFAULT_SCENE_THRESHOLD,
     triage_mode: str = constants.DEFAULT_TRIAGE_MODE,
@@ -1887,6 +1912,7 @@ def analyze_source(
         source,
         (metadata_hint or {}).get("id"),
         (metadata_hint or {}).get("title"),
+        output_root=output_root_base,
     )
     paths = analysis_paths(output_root)
     clear_stale_output_files(paths)
@@ -2121,11 +2147,14 @@ def analyze_source(
             cleanup_non_debug_artifacts(paths)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Analyze a YouTube URL or local media file into transcripts, keyframes, triage, and reports."
-    )
-    parser.add_argument("--source", required=True, help="YouTube URL or local media path")
+def add_analysis_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_source: bool = True,
+    include_out_dir: bool = True,
+) -> argparse.ArgumentParser:
+    if include_source:
+        parser.add_argument("--source", required=True, help="YouTube URL or local media path")
     parser.add_argument(
         "--transcript",
         default="auto",
@@ -2200,11 +2229,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Keep downloaded media and other intermediate files instead of cleaning them after the run",
     )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        help="Override output directory (default: output/youtube/<video-id-or-stem>)",
-    )
+    if include_out_dir:
+        parser.add_argument(
+            "--out-dir",
+            type=Path,
+            help="Override output directory (default: output/youtube/<video-id-or-stem>)",
+        )
     parser.add_argument(
         "--interval-seconds",
         type=int,
@@ -2217,7 +2247,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=constants.DEFAULT_SCENE_THRESHOLD,
         help=f"Scene detection threshold (default: {constants.DEFAULT_SCENE_THRESHOLD})",
     )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze a YouTube URL or local media file into transcripts, keyframes, triage, and reports."
+    )
+    add_analysis_arguments(parser)
     return parser.parse_args(argv)
+
+
+def analysis_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "transcript_mode": args.transcript,
+        "keyframe_mode": args.keyframes,
+        "visuals_mode": args.visuals,
+        "ocr_mode": args.ocr,
+        "burned_subtitles_mode": args.burned_subtitles,
+        "interval_seconds": args.interval_seconds,
+        "scene_threshold": args.scene_threshold,
+        "triage_mode": args.triage,
+        "gpt_mode": args.gpt,
+        "review_mode": args.review,
+        "gpt_model": args.gpt_model,
+        "report_language": args.report_language,
+        "artifacts_mode": args.artifacts,
+        "review_reset": args.review_reset,
+        "cleanup_intermediates": not args.keep_intermediates,
+    }
+    if hasattr(args, "out_dir"):
+        kwargs["out_dir"] = args.out_dir
+    return kwargs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2225,22 +2286,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     output_root = analyze_source(
         args.source,
-        transcript_mode=args.transcript,
-        keyframe_mode=args.keyframes,
-        visuals_mode=args.visuals,
-        ocr_mode=args.ocr,
-        burned_subtitles_mode=args.burned_subtitles,
-        out_dir=args.out_dir,
-        interval_seconds=args.interval_seconds,
-        scene_threshold=args.scene_threshold,
-        triage_mode=args.triage,
-        gpt_mode=args.gpt,
-        review_mode=args.review,
-        gpt_model=args.gpt_model,
-        report_language=args.report_language,
-        artifacts_mode=args.artifacts,
-        review_reset=args.review_reset,
-        cleanup_intermediates=not args.keep_intermediates,
+        **analysis_kwargs_from_args(args),
         progress_callback=StderrProgressReporter(),
     )
     print(output_root)

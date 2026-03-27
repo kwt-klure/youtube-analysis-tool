@@ -92,6 +92,12 @@ that and skip Whisper.
 The CLI also prints simple phase progress to `stderr` while it runs. It is
 intentionally stage-based, not a fake universal percentage bar.
 
+Available entrypoints:
+
+- `youtube-analyze`
+- `youtube-batch`
+- `youtube-library`
+
 OpenAI is optional:
 
 - `--gpt on` needs a valid `OPENAI_API_KEY`
@@ -192,6 +198,18 @@ Enable GPT after your API key is set:
 youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID' --gpt on
 ```
 
+Queue a newline-separated source list:
+
+```bash
+youtube-batch --source-list /path/to/sources.txt
+```
+
+Index and grep local analyzed bundles:
+
+```bash
+youtube-library --grep "prompt engineering"
+```
+
 ## Common Run Patterns
 
 ### Fastest Useful Run For Subtitle-Rich Videos
@@ -220,6 +238,26 @@ youtube-analyze --source /path/to/video.mp4 --artifacts debug
 
 This keeps stage outputs such as `triage/`, `review/`, `routing/`, and
 `visuals/` for inspection.
+
+### Batch Queue
+
+```bash
+youtube-batch --source-list /path/to/sources.txt
+```
+
+This reads one source per line, skips already completed outputs by default,
+continues past failures, and writes a batch report sidecar under
+`output/batches/`.
+
+### Library Index / Filter / Grep
+
+```bash
+youtube-library --trust high --grep "艦これ"
+```
+
+`youtube-library` scans local `output/youtube/**/output.json` bundles on
+demand. It emits JSON Lines and is intentionally a local index/filter/grep
+tool, not a replacement for YouTube search.
 
 ## What `--gpt on` Actually Sends
 
@@ -316,7 +354,7 @@ Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.7",
+  "output_version": "1.0.8",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -335,7 +373,7 @@ Small truncated example:
 
 ```json
 {
-  "output_version": "1.0.7",
+  "output_version": "1.0.8",
   "source": {
     "kind": "youtube",
     "input": "https://www.youtube.com/watch?v=VIDEO_ID"

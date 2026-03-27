@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "youtube-analysis-tool"
-version = "1.0.7"
+version = "1.0.8"
 description = "Hybrid local-first YouTube analysis tooling for transcripts and keyframes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,8 @@ youtube = [
 
 [project.scripts]
 youtube-analyze = "youtube_analysis_tool.pipeline:main"
+youtube-batch = "youtube_analysis_tool.batch:main"
+youtube-library = "youtube_analysis_tool.library:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
