@@ -1,95 +1,63 @@
 ---
 name: youtube-analysis
-description: Use when the task is to turn a YouTube URL or local video/audio file into a transcript, keyframes, OCR artifacts, or a local-first visual triage workflow that minimizes GPT usage.
+description: Turn a YouTube URL or local video/audio file into a transcript, bounded keyframes, OCR artifacts, reused-transcript visual evidence, or a contact sheet with local-first processing. Use for transcript extraction, visual-only inspection, transcript-aligned second passes, screen or slide evidence, share sheets, and debugging the youtube-analysis-tool pipeline while minimizing GPT use.
 ---
 
 # YouTube Analysis
 
-## Overview
-
-Use this skill when a user wants to analyze a YouTube video or local media file without sending every frame to a remote model.
-
-This skill is for:
-
-- transcript extraction
-- keyframe extraction
-- OCR over candidate frames
-- designing or running a local-first routing workflow
-- deciding which frames should be escalated to GPT
+Use this skill for concrete media processing and evidence extraction. Keep
+discussion intake, publishing, and archival decisions outside this processing
+workflow.
 
 ## Workflow
 
-### 1. Normalize the task
+1. Determine the source type and requested evidence.
+2. Read [references/execution-modes.md](references/execution-modes.md) before
+   running a concrete lane.
+3. Select the narrowest lane that can answer the request.
+4. Run local extraction before considering GPT.
+5. Verify process exit, JSON parseability, run status, and errors before using
+   an analysis bundle as evidence.
+6. Read the relevant provenance and evidence-sufficiency fields.
+7. Clean temporary outputs according to the selected lane.
 
-Determine:
+## Lane Selection
 
-- source type: YouTube URL or local media file
-- desired outputs: transcript, keyframes, OCR, or a filtered GPT-ready frame set
-- whether the user wants implementation, design, or one-off analysis
+- Use transcript-first for ordinary semantic intake.
+- Use visual-only when transcript extraction would be unnecessary or too slow.
+- Reuse an existing transcript for a second visual pass instead of rerunning
+  subtitles or ASR.
+- Use contact-sheet mode for short visual/share requests that do not require
+  semantic analysis.
+- Use full rich intake only when multiple visual, audio, or comment layers are
+  independently material.
 
-### 2. Prefer local work first
+Start bounded visual evidence passes with interval-only frames, a conservative
+interval, 720p media, and OCR off. Enable OCR only when selected frames actually
+need text extraction.
 
-Before calling GPT, do as much as possible locally:
+## Success Gate
 
-- metadata inspection with `ffprobe`
-- subtitle retrieval and media download with `yt-dlp`
-- transcript extraction from subtitles
-- fallback transcription with local `whisper`
-- scene-change and interval frame extraction with `ffmpeg`
-- OCR with `tesseract` / `pytesseract`
-- basic image heuristics with `opencv`
+Treat `output.json` as completed evidence only when all are true:
 
-### 3. Triage frames before escalation
+- the wrapper exited with code 0;
+- the JSON parses;
+- `processing.run_status` is `completed`;
+- no fatal entry exists in `errors`.
 
-Default frame buckets:
+Treat `failed` and `aborted` bundles as diagnostic partial output. Never infer
+success merely because `output.json` exists.
 
-- `slides`
-- `chart_table`
-- `talking_head`
-- `b_roll`
-- `uncertain`
+## Local-First Boundary
 
-Recommended routing:
+Use local subtitles, Whisper, ffmpeg, OCR, triage, and provenance before remote
+reasoning. Use GPT only for selected high-value frames or synthesis that local
+evidence cannot supply. Do not send the full video or bulk frame set to GPT.
 
-- keep `slides`
-- keep `chart_table`
-- suppress `talking_head`
-- suppress `b_roll`
-- manually review or selectively escalate `uncertain`
+## Ownership Boundary
 
-### 4. Escalate only high-value frames
-
-Use GPT only when local tools are not enough, for example:
-
-- slide meaning and takeaway
-- chart trend interpretation
-- summary that combines transcript and visual evidence
-
-Do not use GPT for full-video frame scanning or bulk OCR.
-
-## Project files
-
-- main package: `src/youtube_analysis_tool/pipeline.py`
-- CLI wrapper: `scripts/youtube_analyze.py`
-- architecture note: `docs/architecture.md`
-
-## Quick commands
-
-Install:
-
-```bash
-python3 -m pip install -e '.[youtube]'
-```
-
-Run:
-
-```bash
-youtube-analyze --source 'https://www.youtube.com/watch?v=VIDEO_ID'
-```
-
-Local file:
-
-```bash
-youtube-analyze --source /path/to/video.mp4 --transcript whisper --ocr on
-```
-
+- `youtube-analysis-tool` is executable truth.
+- This repo-owned skill is the canonical processing workflow.
+- The installed runtime skill is a deployed copy and should match this folder.
+- `youtube-intake` owns conversational evidence escalation and optional
+  archival routing.

@@ -19,7 +19,24 @@ from youtube_analysis_tool import batch, library, pipeline
 from youtube_analysis_tool.artifacts import write_json
 
 
+def expected_project_version() -> str:
+    return next(
+        line.partition("=")[2].strip().strip('"')
+        for line in (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+        if line.startswith("version =")
+    )
+
+
 class BatchQueueTests(unittest.TestCase):
+    def test_batch_version_flag_prints_project_version_and_exits(self) -> None:
+        stdout = io.StringIO()
+
+        with self.assertRaises(SystemExit) as context, mock.patch("sys.stdout", stdout):
+            batch.parse_args(["--version"])
+
+        self.assertEqual(0, context.exception.code)
+        self.assertEqual(f"youtube-analysis-tool {expected_project_version()}\n", stdout.getvalue())
+
     def test_read_source_list_ignores_comments_and_blank_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_list = Path(tmpdir) / "sources.txt"
@@ -39,7 +56,13 @@ class BatchQueueTests(unittest.TestCase):
             batch_root = root / "batches"
             existing = output_root / "my-great-talk-abc-123"
             existing.mkdir(parents=True, exist_ok=True)
-            (existing / "output.json").write_text("{}", encoding="utf-8")
+            write_json(
+                existing / "output.json",
+                {
+                    "transcript": {"source": "subtitle_manual"},
+                    "errors": [],
+                },
+            )
             source_list = root / "sources.txt"
             source_list.write_text("https://www.youtube.com/watch?v=AbC_123\n", encoding="utf-8")
             stdout = io.StringIO()
@@ -58,6 +81,64 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual({"queued": 1, "completed": 0, "skipped": 1, "failed": 0}, payload["totals"])
         self.assertEqual("skipped", payload["items"][0]["status"])
         self.assertEqual(str(existing), payload["items"][0]["output_path"])
+
+    def test_batch_reruns_failed_partial_output_instead_of_skipping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_root = root / "youtube"
+            batch_root = root / "batches"
+            existing = output_root / "my-great-talk-abc-123"
+            existing.mkdir(parents=True, exist_ok=True)
+            write_json(
+                existing / "output.json",
+                {
+                    "transcript": {"source": None, "segment_count": 0},
+                    "errors": [{"stage": "analyze", "message": "boom"}],
+                },
+            )
+            source_list = root / "sources.txt"
+            source_list.write_text("https://www.youtube.com/watch?v=AbC_123\n", encoding="utf-8")
+            stdout = io.StringIO()
+
+            with mock.patch.object(batch.constants, "BATCH_REPORT_ROOT", batch_root), mock.patch(
+                "youtube_analysis_tool.batch.analyze_source",
+                return_value=existing,
+            ) as analyze_mock, mock.patch("sys.stdout", stdout):
+                exit_code = batch.main(
+                    ["--source-list", str(source_list), "--root", str(output_root)]
+                )
+                report_path = Path(stdout.getvalue().strip())
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(0, exit_code)
+        analyze_mock.assert_called_once()
+        self.assertEqual({"queued": 1, "completed": 1, "skipped": 0, "failed": 0}, payload["totals"])
+        self.assertEqual("completed", payload["items"][0]["status"])
+        self.assertEqual(str(existing), payload["items"][0]["output_path"])
+
+    def test_batch_completion_requires_completed_new_run_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            completed = root / "completed.json"
+            failed = root / "failed.json"
+            aborted = root / "aborted.json"
+            for path, run_status in (
+                (completed, "completed"),
+                (failed, "failed"),
+                (aborted, "aborted"),
+            ):
+                write_json(
+                    path,
+                    {
+                        "transcript": {"source": "subtitle_manual"},
+                        "processing": {"run_status": run_status},
+                        "errors": [],
+                    },
+                )
+
+            self.assertTrue(batch.is_completed_output_bundle(completed))
+            self.assertFalse(batch.is_completed_output_bundle(failed))
+            self.assertFalse(batch.is_completed_output_bundle(aborted))
 
     def test_batch_continues_after_failure_and_returns_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -115,6 +196,15 @@ class BatchQueueTests(unittest.TestCase):
 
 
 class LibraryIndexTests(unittest.TestCase):
+    def test_library_version_flag_prints_project_version_and_exits(self) -> None:
+        stdout = io.StringIO()
+
+        with self.assertRaises(SystemExit) as context, mock.patch("sys.stdout", stdout):
+            library.parse_args(["--version"])
+
+        self.assertEqual(0, context.exception.code)
+        self.assertEqual(f"youtube-analysis-tool {expected_project_version()}\n", stdout.getvalue())
+
     def test_library_derives_high_trust_for_manual_subtitles(self) -> None:
         payload = {
             "source": {"input": "https://youtu.be/demo"},

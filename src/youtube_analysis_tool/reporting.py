@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from . import constants
+from . import constants, reflection
 from .artifacts import write_json
 
 
@@ -104,6 +104,8 @@ def normalize_transcript_segments(segments: list[dict[str, Any]] | None) -> list
 
 def transcript_extraction_kind(source: str | None) -> str | None:
     value = str(source or "")
+    if value == "skipped":
+        return "skipped"
     if value in {"subtitle", "subtitle_manual", "subtitle_auto"}:
         return "text_track"
     if value == "burned_subtitle_ocr":
@@ -119,6 +121,8 @@ def transcript_extraction_kind(source: str | None) -> str | None:
 
 def transcript_quality_notes(source: str | None) -> list[str]:
     value = str(source or "")
+    if value == "skipped":
+        return ["transcript_extraction_skipped"]
     if value in {"subtitle", "subtitle_manual"}:
         return []
     if value == "subtitle_auto":
@@ -132,6 +136,17 @@ def transcript_quality_notes(source: str | None) -> list[str]:
     if not value:
         return ["transcript_missing"]
     return ["transcript_source_unknown"]
+
+
+def transcript_extraction_status(transcript: dict[str, Any] | None) -> str:
+    transcript = transcript or {}
+    if transcript.get("status") == "skipped" or transcript.get("source") == "skipped":
+        return "skipped"
+    if transcript.get("status") == "reused" or transcript.get("reused_from"):
+        return "reused"
+    if transcript.get("source"):
+        return "extracted"
+    return "missing"
 
 
 def normalize_segment_text_for_quality(text: str) -> str:
@@ -222,12 +237,18 @@ def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[s
     transcript = transcript or {}
     source = transcript.get("source")
     extraction_kind = transcript_extraction_kind(source)
-    return {
+    provenance = {
         "source": source,
+        "status": transcript_extraction_status(transcript),
         "extraction_kind": extraction_kind,
         "is_direct_text_track": extraction_kind == "text_track",
         "quality_notes": transcript_quality_notes(source),
     }
+    if transcript.get("reused_from"):
+        provenance["reused_from"] = transcript["reused_from"]
+    if transcript.get("skip_reason"):
+        provenance["skip_reason"] = transcript["skip_reason"]
+    return provenance
 
 
 def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
@@ -294,11 +315,99 @@ def normalize_visuals_payload(
     }
 
 
+def normalize_audio_features(audio_features: dict[str, Any] | None) -> dict[str, Any]:
+    audio_features = audio_features or {}
+    return {
+        "status": audio_features.get("status", "disabled"),
+        "source": audio_features.get("source"),
+        "summary": audio_features.get("summary") or {},
+        "silence_segments": audio_features.get("silence_segments") or [],
+        "windows": audio_features.get("windows") or [],
+        "quiet_segments": audio_features.get("quiet_segments") or [],
+        "loud_segments": audio_features.get("loud_segments") or [],
+        "large_changes": audio_features.get("large_changes") or [],
+        "interpretation_warning": audio_features.get("interpretation_warning")
+        or "audio features are structural evidence and routing signals, not semantic conclusions",
+        "top_quiet_windows": audio_features.get("top_quiet_windows") or [],
+        "top_loud_windows": audio_features.get("top_loud_windows") or [],
+        "provenance": audio_features.get("provenance")
+        or {
+            "method": None,
+            "trust": "structural_signal_not_semantics",
+            "quality_notes": [
+                "audio features are evidence, not interpretation",
+            ],
+        },
+        **({"error": audio_features["error"]} if audio_features.get("error") else {}),
+    }
+
+
+def normalize_comments(comments: dict[str, Any] | None) -> dict[str, Any]:
+    comments = comments or {}
+    items = comments.get("items") or []
+    return {
+        "status": comments.get("status", "disabled"),
+        "requested_count": int(comments.get("requested_count") or 0),
+        "returned_count": int(comments.get("returned_count") or len(items)),
+        "source": comments.get("source"),
+        "items": items,
+        "interpretation_notes": comments.get("interpretation_notes")
+        or [
+            "top comments are contextual signals, not representative sampling",
+        ],
+        "provenance": comments.get("provenance")
+        or {
+            "method": None,
+            "sort": "top",
+            "trust": "contextual_signal_not_semantics",
+        },
+        **({"error": comments["error"]} if comments.get("error") else {}),
+    }
+
+
+def normalize_visual_sampling(
+    visual_sampling: dict[str, Any] | None,
+    *,
+    visuals_payload: dict[str, list[dict[str, Any]]],
+    visuals_mode: str,
+) -> dict[str, Any]:
+    visual_sampling = visual_sampling or {}
+    retained_slide_count = len(visuals_payload.get("slides", []))
+    retained_chart_count = len(visuals_payload.get("charts", []))
+    return {
+        "status": visual_sampling.get("status", "extracted" if visuals_mode == "on" else "skipped"),
+        "profile": visual_sampling.get("profile"),
+        "density": visual_sampling.get("density"),
+        "keyframe_mode": visual_sampling.get("keyframe_mode", "off"),
+        "interval_seconds": visual_sampling.get("interval_seconds"),
+        "scene_threshold": visual_sampling.get("scene_threshold"),
+        "candidate_frame_count": int(visual_sampling.get("candidate_frame_count") or 0),
+        "retained_visual_count": int(
+            visual_sampling.get("retained_visual_count", retained_slide_count + retained_chart_count)
+        ),
+        "retained_slide_count": int(visual_sampling.get("retained_slide_count", retained_slide_count)),
+        "retained_chart_count": int(visual_sampling.get("retained_chart_count", retained_chart_count)),
+        "provenance": visual_sampling.get("provenance")
+        or {
+            "method": None,
+            "trust": "sampling_signal_not_semantics",
+            "quality_notes": [
+                "visual sampling exposes evidence candidates, not complete visual understanding",
+            ],
+        },
+    }
+
+
 def summarize_provenance(
     *,
+    source_is_url: bool,
+    max_video_height: int | None,
     transcript: dict[str, Any] | None,
     visuals_payload: dict[str, list[dict[str, Any]]],
     visuals_mode: str,
+    visual_sampling: dict[str, Any],
+    audio_features: dict[str, Any],
+    comments: dict[str, Any],
 ) -> dict[str, Any]:
     visuals_provenance: dict[str, Any]
     if visuals_mode == "on":
@@ -326,30 +435,62 @@ def summarize_provenance(
             "extraction_kind": "direct_metadata_extract",
             "quality_notes": [],
         },
+        "media": {
+            "selection_kind": (
+                "local_source"
+                if not source_is_url
+                else "yt_dlp_height_bounded"
+                if max_video_height is not None
+                else "yt_dlp_default"
+            ),
+            "requested_max_video_height": max_video_height,
+            "height_limit_applied": source_is_url and max_video_height is not None,
+            "quality_notes": [
+                "requested height constrains preferred formats but source availability controls the final selection"
+            ]
+            if source_is_url and max_video_height is not None
+            else [],
+        },
         "transcript": normalize_transcript_provenance(transcript),
         "visuals": visuals_provenance,
+        "visual_sampling": visual_sampling.get("provenance") or {},
+        "audio_features": audio_features.get("provenance") or {},
+        "comments": comments.get("provenance") or {},
     }
 
 
 def summarize_processing(
     *,
+    run_status: str,
+    max_video_height: int | None,
     transcript: dict[str, Any] | None,
     ocr: dict[str, Any],
     burned_subtitles: dict[str, Any],
+    audio_features: dict[str, Any],
+    comments: dict[str, Any],
     visuals_payload: dict[str, list[dict[str, Any]]],
     cleanup_intermediates: bool,
+    intake_profile: str,
     transcript_mode: str,
     visuals_mode: str,
+    visual_density: str,
     ocr_mode: str,
+    audio_features_mode: str,
+    comments_count: int,
     gpt_mode: str,
     artifacts_mode: str,
     errors: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
+        "run_status": run_status,
+        "requested_max_video_height": max_video_height,
+        "intake_profile": intake_profile,
         "transcript_mode": transcript_mode,
         "visuals_mode": visuals_mode,
+        "visual_density": visual_density,
         "ocr_mode": ocr_mode,
         "burned_subtitles_mode": burned_subtitles.get("mode"),
+        "audio_features_mode": audio_features_mode,
         "gpt_enabled": gpt_mode == "on",
         "artifact_mode": artifacts_mode,
         "cleanup_applied": cleanup_intermediates,
@@ -358,6 +499,10 @@ def summarize_processing(
         "burned_subtitles_reason": burned_subtitles.get("reason"),
         "burned_subtitles_probe_hits": burned_subtitles.get("probe_hits", 0),
         "burned_subtitles_ocr_events": burned_subtitles.get("ocr_event_count", 0),
+        "audio_features_status": audio_features.get("status"),
+        "comments_status": comments.get("status"),
+        "comments_requested_count": comments_count,
+        "comments_returned_count": comments.get("returned_count", 0),
         "counts": {
             "transcript_segments": len((transcript or {}).get("segments", [])),
             "slide_count": len(visuals_payload.get("slides", [])),
@@ -384,9 +529,32 @@ def build_output_payload(
     ocr_mode: str,
     gpt_mode: str,
     artifacts_mode: str,
+    intake_profile: str = "default",
+    visual_density: str = "default",
+    audio_features_mode: str = "off",
+    comments_count: int = 0,
+    audio_features: dict[str, Any] | None = None,
+    comments: dict[str, Any] | None = None,
+    visual_sampling: dict[str, Any] | None = None,
+    run_status: str = "completed",
+    max_video_height: int | None = None,
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_visuals = normalize_visuals_payload(visuals_payload)
+    normalized_audio_features = normalize_audio_features(audio_features)
+    normalized_comments = normalize_comments(comments)
+    normalized_visual_sampling = normalize_visual_sampling(
+        visual_sampling,
+        visuals_payload=normalized_visuals,
+        visuals_mode=visuals_mode,
+    )
+    run_reflection = reflection.build_run_reflection(
+        transcript=normalize_transcript(transcript),
+        visuals=normalized_visuals,
+        visual_sampling=normalized_visual_sampling,
+        audio_features=normalized_audio_features,
+        comments=normalized_comments,
+    )
     payload = {
         "output_version": constants.OUTPUT_VERSION,
         "source": normalize_source(
@@ -397,23 +565,40 @@ def build_output_payload(
         "metadata": normalize_metadata(metadata),
         "transcript": normalize_transcript(transcript),
         "visuals": normalized_visuals,
+        "visual_sampling": normalized_visual_sampling,
+        "audio_features": normalized_audio_features,
+        "comments": normalized_comments,
+        "run_reflection": run_reflection,
         "processing": summarize_processing(
+            run_status=run_status,
+            max_video_height=max_video_height,
             transcript=transcript,
             ocr=ocr,
             burned_subtitles=burned_subtitles,
+            audio_features=normalized_audio_features,
+            comments=normalized_comments,
             visuals_payload=normalized_visuals,
             cleanup_intermediates=cleanup_intermediates,
+            intake_profile=intake_profile,
             transcript_mode=transcript_mode,
             visuals_mode=visuals_mode,
+            visual_density=visual_density,
             ocr_mode=ocr_mode,
+            audio_features_mode=audio_features_mode,
+            comments_count=comments_count,
             gpt_mode=gpt_mode,
             artifacts_mode=artifacts_mode,
             errors=errors,
         ),
         "provenance": summarize_provenance(
+            source_is_url=is_url,
+            max_video_height=max_video_height,
             transcript=transcript,
             visuals_payload=normalized_visuals,
             visuals_mode=visuals_mode,
+            visual_sampling=normalized_visual_sampling,
+            audio_features=normalized_audio_features,
+            comments=normalized_comments,
         ),
         "errors": errors,
     }
@@ -440,6 +625,15 @@ def write_output_file(
     ocr_mode: str,
     gpt_mode: str,
     artifacts_mode: str,
+    intake_profile: str = "default",
+    visual_density: str = "default",
+    audio_features_mode: str = "off",
+    comments_count: int = 0,
+    audio_features: dict[str, Any] | None = None,
+    comments: dict[str, Any] | None = None,
+    visual_sampling: dict[str, Any] | None = None,
+    run_status: str = "completed",
+    max_video_height: int | None = None,
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = build_output_payload(
@@ -450,12 +644,21 @@ def write_output_file(
         transcript=transcript,
         ocr=ocr,
         burned_subtitles=burned_subtitles,
+        audio_features=audio_features,
+        comments=comments,
+        visual_sampling=visual_sampling,
         visuals_payload=visuals_payload,
         errors=errors,
+        run_status=run_status,
+        max_video_height=max_video_height,
         cleanup_intermediates=cleanup_intermediates,
+        intake_profile=intake_profile,
         transcript_mode=transcript_mode,
         visuals_mode=visuals_mode,
+        visual_density=visual_density,
         ocr_mode=ocr_mode,
+        audio_features_mode=audio_features_mode,
+        comments_count=comments_count,
         gpt_mode=gpt_mode,
         artifacts_mode=artifacts_mode,
         gpt_payload=gpt_payload,

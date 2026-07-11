@@ -363,6 +363,12 @@ class OutputBundleTests(unittest.TestCase):
         )
         self.assertEqual(1, written["provenance"]["visuals"]["slides"]["count"])
         self.assertEqual(["segment-0001"], written["provenance"]["visuals"]["slides"]["segment_ids"])
+        self.assertIn("run_reflection", written)
+        self.assertEqual("limited", written["run_reflection"]["status"])
+        self.assertEqual(
+            "local_heuristic_cross_signal_reflection",
+            written["run_reflection"]["provenance"]["method"],
+        )
         self.assertNotIn("gpt", written)
 
     def test_output_json_can_embed_gpt_payload(self) -> None:
@@ -559,6 +565,99 @@ class OutputBundleTests(unittest.TestCase):
             )
 
         self.assertNotIn("interpretation", payload["transcript"])
+
+    def test_output_json_includes_multimodal_signals_and_visual_sampling_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = pipeline.analysis_paths(root)
+
+            payload = reporting.write_output_file(
+                paths,
+                source_input="https://youtu.be/demo",
+                is_url=True,
+                is_youtube_url=True,
+                metadata={"id": "demo", "title": "Demo"},
+                transcript={"source": "subtitle_manual", "text": "Transcript", "segments": []},
+                ocr={"mode": "auto", "status": "completed", "attempted": True, "frame_count": 3, "error": None},
+                burned_subtitles={"mode": "off", "status": "not_attempted", "attempted": False, "probe_passed": False, "ocr_event_count": 0, "error": None},
+                visuals_payload={"slides": [{"segment_id": "segment-0001"}], "charts": []},
+                audio_features={
+                    "status": "extracted",
+                    "source": "local_ffmpeg_python_rms",
+                    "summary": {
+                        "duration_seconds": 30.0,
+                        "silence_ratio": 0.2,
+                        "mean_dbfs": -18.4,
+                        "dynamic_range_hint": "moderate_variation",
+                    },
+                    "silence_segments": [{"start": 12.0, "end": 18.0, "duration": 6.0}],
+                    "windows": [{"start": 0.0, "end": 15.0, "rms_db": -18.5}],
+                    "quiet_segments": [{"start": 12.0, "end": 18.0, "rms_db": -32.0}],
+                    "loud_segments": [{"start": 0.0, "end": 12.0, "rms_db": -12.0}],
+                    "large_changes": [
+                        {
+                            "start": 0.0,
+                            "end": 15.0,
+                            "from_dbfs": -12.0,
+                            "to_dbfs": -19.0,
+                            "delta_db": -7.0,
+                            "interpretation_hint": "possible location, scene, or production-context change",
+                        }
+                    ],
+                    "interpretation_warning": "audio features are structural evidence and routing signals, not semantic conclusions",
+                    "provenance": {"trust": "structural_signal_not_semantics"},
+                },
+                comments={
+                    "status": "extracted",
+                    "requested_count": 5,
+                    "returned_count": 1,
+                    "source": "yt_dlp_python_api",
+                    "items": [{"id": "comment-1", "text": "Helpful comment", "like_count": 3}],
+                    "interpretation_notes": ["top comments are contextual signals, not representative sampling"],
+                    "provenance": {"sort": "top"},
+                },
+                visual_sampling={
+                    "status": "extracted",
+                    "profile": "rich",
+                    "density": "dense",
+                    "keyframe_mode": "scene+interval",
+                    "interval_seconds": 15,
+                    "scene_threshold": 0.35,
+                    "candidate_frame_count": 3,
+                    "retained_visual_count": 1,
+                    "provenance": {"trust": "sampling_signal_not_semantics"},
+                },
+                errors=[],
+                cleanup_intermediates=True,
+                transcript_mode="auto",
+                visuals_mode="on",
+                visual_density="dense",
+                audio_features_mode="on",
+                comments_count=5,
+                intake_profile="rich",
+                ocr_mode="auto",
+                gpt_mode="off",
+                artifacts_mode="minimal",
+            )
+
+        self.assertEqual("rich", payload["processing"]["intake_profile"])
+        self.assertEqual("dense", payload["processing"]["visual_density"])
+        self.assertEqual("on", payload["processing"]["audio_features_mode"])
+        self.assertEqual(5, payload["processing"]["comments_requested_count"])
+        self.assertEqual("extracted", payload["audio_features"]["status"])
+        self.assertEqual("moderate_variation", payload["audio_features"]["summary"]["dynamic_range_hint"])
+        self.assertEqual(
+            "audio features are structural evidence and routing signals, not semantic conclusions",
+            payload["audio_features"]["interpretation_warning"],
+        )
+        self.assertEqual(1, len(payload["audio_features"]["large_changes"]))
+        self.assertEqual("extracted", payload["comments"]["status"])
+        self.assertEqual("dense", payload["visual_sampling"]["density"])
+        self.assertEqual(15, payload["visual_sampling"]["interval_seconds"])
+        self.assertEqual(
+            "sampling_signal_not_semantics",
+            payload["provenance"]["visual_sampling"]["trust"],
+        )
 
 class VisualPayloadTests(unittest.TestCase):
     def test_build_embedded_visuals_exports_only_slides_and_charts(self) -> None:

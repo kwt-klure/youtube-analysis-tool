@@ -5,6 +5,7 @@ import csv
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -21,12 +22,19 @@ from xml.etree import ElementTree
 
 from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
+from .version import add_version_argument
 
 
 HAN_CHARACTER_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_CHARACTER_PATTERN = re.compile(r"[A-Za-z]")
 DIGIT_CHARACTER_PATTERN = re.compile(r"\d")
 VISIBLE_CHARACTER_PATTERN = re.compile(r"\S")
+PREFERRED_COMMAND_DIRS = (
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+)
 
 
 def _strip_env_value(raw: str) -> str:
@@ -70,6 +78,25 @@ def load_local_env(start: Path | None = None) -> dict[str, str]:
     if dotenv_path is None:
         return {}
     return load_dotenv_file(dotenv_path)
+
+
+def build_command_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    if overrides:
+        env.update(overrides)
+    raw_path = env.get("PATH", "")
+    entries = [entry for entry in raw_path.split(os.pathsep) if entry]
+    for directory in reversed(PREFERRED_COMMAND_DIRS):
+        if directory not in entries and Path(directory).exists():
+            entries.insert(0, directory)
+    env["PATH"] = os.pathsep.join(entries)
+    return env
+
+
+def resolve_command(name: str) -> tuple[str | None, dict[str, str]]:
+    env = build_command_env()
+    resolved = shutil.which(name, path=env.get("PATH"))
+    return resolved, env
 
 
 @dataclass(frozen=True)
@@ -326,12 +353,13 @@ def run_command(
     env: dict[str, str] | None = None,
     capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    effective_env = build_command_env(env)
     return subprocess.run(
         command,
         check=True,
         text=True,
         capture_output=capture_output,
-        env=env,
+        env=effective_env,
     )
 
 
@@ -372,6 +400,270 @@ def duration_seconds(metadata: dict[str, Any]) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return 0.0
+
+
+def rms_db(samples: Any) -> float:
+    import numpy
+
+    if len(samples) == 0:
+        return -100.0
+    rms = float(numpy.sqrt(numpy.mean(numpy.square(samples.astype("float64")))))
+    if rms <= 0.0:
+        return -100.0
+    return round(max(-100.0, 20.0 * math.log10(rms)), 3)
+
+
+def audio_window_records(
+    samples: Any,
+    *,
+    sample_rate: int,
+    window_seconds: int,
+) -> list[dict[str, Any]]:
+    window_size = max(1, int(sample_rate * max(1, window_seconds)))
+    records: list[dict[str, Any]] = []
+    for start_index in range(0, len(samples), window_size):
+        end_index = min(len(samples), start_index + window_size)
+        start_seconds = round(start_index / float(sample_rate), 3)
+        end_seconds = round(end_index / float(sample_rate), 3)
+        records.append(
+            {
+                "start": start_seconds,
+                "end": end_seconds,
+                "rms_db": rms_db(samples[start_index:end_index]),
+            }
+        )
+    return records
+
+
+def audio_dynamic_range_hint(windows: list[dict[str, Any]]) -> str | None:
+    if not windows:
+        return None
+    values = [float(window["rms_db"]) for window in windows]
+    spread = max(values) - min(values)
+    if spread < 6.0:
+        return "compressed_or_flat"
+    if spread < 12.0:
+        return "moderate_variation"
+    return "wide_or_high_contrast"
+
+
+def audio_extreme_windows(
+    windows: list[dict[str, Any]],
+    *,
+    quiet: bool,
+    limit: int = constants.DEFAULT_AUDIO_TOP_SEGMENT_COUNT,
+) -> list[dict[str, Any]]:
+    sorted_windows = sorted(windows, key=lambda window: float(window["rms_db"]), reverse=not quiet)
+    return [
+        {
+            "start": window.get("start"),
+            "end": window.get("end"),
+            "rms_db": window.get("rms_db"),
+        }
+        for window in sorted_windows[: max(0, limit)]
+    ]
+
+
+def audio_large_changes(
+    windows: list[dict[str, Any]],
+    *,
+    threshold_db: float = constants.DEFAULT_AUDIO_LARGE_CHANGE_DB,
+) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for previous, current in zip(windows, windows[1:]):
+        from_dbfs = float(previous["rms_db"])
+        to_dbfs = float(current["rms_db"])
+        delta = round(to_dbfs - from_dbfs, 3)
+        if abs(delta) < threshold_db:
+            continue
+        changes.append(
+            {
+                "start": previous.get("start"),
+                "end": current.get("end"),
+                "from_dbfs": from_dbfs,
+                "to_dbfs": to_dbfs,
+                "delta_db": delta,
+                "interpretation_hint": "possible location, scene, or production-context change",
+            }
+        )
+    return changes
+
+
+def detect_silence_segments(
+    samples: Any,
+    *,
+    sample_rate: int,
+    silence_threshold_db: float,
+    min_duration_seconds: float,
+) -> list[dict[str, Any]]:
+    chunk_size = max(1, int(sample_rate * 0.1))
+    segments: list[dict[str, Any]] = []
+    active_start: float | None = None
+    active_end: float | None = None
+    for start_index in range(0, len(samples), chunk_size):
+        end_index = min(len(samples), start_index + chunk_size)
+        chunk_db = rms_db(samples[start_index:end_index])
+        chunk_start = start_index / float(sample_rate)
+        chunk_end = end_index / float(sample_rate)
+        if chunk_db <= silence_threshold_db:
+            if active_start is None:
+                active_start = chunk_start
+            active_end = chunk_end
+            continue
+        if active_start is not None and active_end is not None:
+            duration = active_end - active_start
+            if duration >= min_duration_seconds:
+                segments.append(
+                    {
+                        "start": round(active_start, 3),
+                        "end": round(active_end, 3),
+                        "duration": round(duration, 3),
+                    }
+                )
+            active_start = None
+            active_end = None
+    if active_start is not None and active_end is not None:
+        duration = active_end - active_start
+        if duration >= min_duration_seconds:
+            segments.append(
+                {
+                    "start": round(active_start, 3),
+                    "end": round(active_end, 3),
+                    "duration": round(duration, 3),
+                }
+            )
+    return segments
+
+
+def default_audio_features_payload(mode: str) -> dict[str, Any]:
+    return {
+        "status": "disabled" if mode == "off" else "not_attempted",
+        "source": None,
+        "summary": {},
+        "silence_segments": [],
+        "windows": [],
+        "quiet_segments": [],
+        "loud_segments": [],
+        "large_changes": [],
+        "interpretation_warning": "audio features are structural evidence and routing signals, not semantic conclusions",
+        "top_quiet_windows": [],
+        "top_loud_windows": [],
+        "provenance": {
+            "method": None,
+            "threshold_db": constants.DEFAULT_AUDIO_SILENCE_THRESHOLD_DB,
+            "trust": "structural_signal_not_semantics",
+            "quality_notes": [
+                "audio features are evidence, not interpretation",
+                "similar silence or loudness patterns can mean different things in different video genres",
+            ],
+        },
+    }
+
+
+def extract_audio_features(
+    media_path: Path,
+    metadata: dict[str, Any],
+    *,
+    sample_rate: int = constants.DEFAULT_AUDIO_FEATURE_SAMPLE_RATE,
+    window_seconds: int = constants.DEFAULT_AUDIO_FEATURE_WINDOW_SECONDS,
+    silence_threshold_db: float = constants.DEFAULT_AUDIO_SILENCE_THRESHOLD_DB,
+    silence_min_duration: float = constants.DEFAULT_AUDIO_SILENCE_MIN_DURATION_SECONDS,
+) -> dict[str, Any]:
+    import numpy
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(media_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "-",
+    ]
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        env=build_command_env(),
+    )
+    samples = numpy.frombuffer(result.stdout, dtype=numpy.int16).astype("float32") / 32768.0
+    measured_duration = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
+    duration = duration_seconds(metadata) or measured_duration
+    windows = audio_window_records(
+        samples,
+        sample_rate=sample_rate,
+        window_seconds=window_seconds,
+    )
+    silence_segments = detect_silence_segments(
+        samples,
+        sample_rate=sample_rate,
+        silence_threshold_db=silence_threshold_db,
+        min_duration_seconds=silence_min_duration,
+    )
+    silence_duration = sum(float(segment["duration"]) for segment in silence_segments)
+    silence_ratio = round(silence_duration / duration, 3) if duration > 0 else 0.0
+    quiet_windows = sorted(windows, key=lambda window: float(window["rms_db"]))[:3]
+    loud_windows = sorted(windows, key=lambda window: float(window["rms_db"]), reverse=True)[:3]
+    mean_dbfs = rms_db(samples)
+    return {
+        "status": "extracted",
+        "source": "local_ffmpeg_python_rms",
+        "summary": {
+            "duration_seconds": round(duration, 3),
+            "silence_ratio": silence_ratio,
+            "mean_loudness_db": mean_dbfs,
+            "mean_dbfs": mean_dbfs,
+            "dynamic_range_hint": audio_dynamic_range_hint(windows),
+            "window_seconds": window_seconds,
+        },
+        "silence_segments": silence_segments,
+        "windows": windows,
+        "quiet_segments": audio_extreme_windows(windows, quiet=True),
+        "loud_segments": audio_extreme_windows(windows, quiet=False),
+        "large_changes": audio_large_changes(windows),
+        "interpretation_warning": "audio features are structural evidence and routing signals, not semantic conclusions",
+        "top_quiet_windows": quiet_windows,
+        "top_loud_windows": loud_windows,
+        "provenance": {
+            "method": "ffmpeg_pcm_decode_plus_python_rms_windows",
+            "threshold_db": silence_threshold_db,
+            "sample_rate": sample_rate,
+            "trust": "structural_signal_not_semantics",
+            "quality_notes": [
+                "audio features are evidence, not interpretation",
+                "silence and loudness patterns need genre and context before semantic claims",
+            ],
+        },
+    }
+
+
+def run_audio_features_stage(
+    media_path: Path | None,
+    metadata: dict[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    if mode == "off":
+        return default_audio_features_payload(mode)
+    if media_path is None:
+        payload = default_audio_features_payload(mode)
+        payload["status"] = "not_applicable"
+        payload["error"] = "no_media_path_available"
+        return payload
+    try:
+        return extract_audio_features(media_path, metadata)
+    except Exception as exc:
+        payload = default_audio_features_payload(mode)
+        payload["status"] = "failed"
+        payload["error"] = str(exc)
+        return payload
 
 
 def link_local_source(source_path: Path, destination_dir: Path) -> Path:
@@ -731,6 +1023,44 @@ def write_transcript(paths: AnalysisPaths, transcript: dict[str, Any]) -> None:
     paths.transcript_text_path.write_text(transcript.get("text", "").strip() + "\n", encoding="utf-8")
 
 
+def skipped_transcript(reason: str = "transcript_mode_off") -> dict[str, Any]:
+    return {
+        "source": "skipped",
+        "language": None,
+        "source_path": None,
+        "segment_count": 0,
+        "text": "",
+        "segments": [],
+        "status": "skipped",
+        "skip_reason": reason,
+    }
+
+
+def normalize_reused_transcript_payload(payload: dict[str, Any], source_path: Path) -> dict[str, Any]:
+    transcript_payload = payload.get("transcript") if isinstance(payload.get("transcript"), dict) else payload
+    segments = transcript_payload.get("segments") or []
+    text = transcript_payload.get("text")
+    if text is None:
+        text = transcript_payload.get("full_text", "")
+    transcript = dict(transcript_payload)
+    transcript["text"] = text or ""
+    transcript["segments"] = segments
+    transcript["segment_count"] = transcript_payload.get("segment_count", len(segments))
+    transcript["status"] = "reused"
+    transcript["reused_from"] = str(source_path)
+    return transcript
+
+
+def load_reused_transcript(path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+    source_path = path.expanduser().resolve()
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Reusable transcript must be a JSON object: {source_path}")
+    transcript = normalize_reused_transcript_payload(payload, source_path)
+    write_transcript(paths, transcript)
+    return transcript
+
+
 def transcript_from_subtitles(subtitle_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
     segments = parse_subtitle_file(subtitle_path)
     language = detect_language_from_filename(subtitle_path)
@@ -824,10 +1154,10 @@ def is_effective_burned_subtitle_text(text: str) -> bool:
 
 
 def available_tesseract_languages() -> set[str]:
-    tesseract_bin = shutil.which("tesseract")
+    tesseract_bin, env = resolve_command("tesseract")
     if tesseract_bin is None:
         return set()
-    result = run_command([tesseract_bin, "--list-langs"])
+    result = run_command([tesseract_bin, "--list-langs"], env=env)
     languages: set[str] = set()
     for line in result.stdout.splitlines():
         token = line.strip()
@@ -928,6 +1258,7 @@ def iter_subtitle_band_frames(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=build_command_env(),
     )
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Failed to open ffmpeg pipe for burned subtitle OCR.")
@@ -1353,12 +1684,12 @@ def transcribe_with_openai_skill(audio_path: Path, paths: AnalysisPaths) -> dict
 
 
 def transcribe_with_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
-    whisper_bin = shutil.which("whisper")
+    whisper_bin, command_env = resolve_command("whisper")
     if whisper_bin is None:
         raise FileNotFoundError("whisper command is not available.")
     temp_dir = paths.root / "tmp-whisper"
     temp_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
+    env = build_command_env(command_env)
     env.setdefault("OMP_NUM_THREADS", "1")
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     command = [
@@ -1664,6 +1995,122 @@ def fetch_youtube_metadata(
     )
 
 
+def default_comments_payload(requested_count: int, *, status: str = "disabled") -> dict[str, Any]:
+    return {
+        "status": status,
+        "requested_count": requested_count,
+        "returned_count": 0,
+        "source": None,
+        "items": [],
+        "interpretation_notes": [
+            "top comments are contextual signals, not representative sampling",
+            "comments are hints about visible audience context, not ground truth",
+        ],
+        "provenance": {
+            "method": None,
+            "sort": "top",
+            "trust": "contextual_signal_not_semantics",
+        },
+    }
+
+
+def normalize_comment_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return None
+    return {
+        "id": item.get("id"),
+        "text": text,
+        "like_count": item.get("like_count"),
+        "reply_count": item.get("reply_count"),
+        "published_at": item.get("timestamp") or item.get("time_text"),
+        "is_pinned": item.get("is_pinned"),
+        "provenance": {
+            "source": "yt_dlp.comments",
+            "trust": "contextual_signal_not_semantics",
+        },
+    }
+
+
+def fetch_youtube_comments(
+    url: str,
+    *,
+    requested_count: int,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    limit = max(0, int(requested_count))
+    if limit <= 0:
+        return default_comments_payload(limit)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": constants.DEFAULT_YTDLP_METADATA_SOCKET_TIMEOUT_SECONDS,
+        "getcomments": True,
+        "extractor_args": {
+            "youtube": {
+                "comment_sort": ["top"],
+                "max_comments": [str(limit)],
+            }
+        },
+    }
+    info = _run_yt_dlp_extract_info(
+        opts,
+        url,
+        download=False,
+        progress_callback=progress_callback,
+        phase="comments",
+        retry_message="YouTube comments fetch stalled",
+    )
+    items = [
+        normalized
+        for item in info.get("comments") or []
+        if isinstance(item, dict)
+        for normalized in [normalize_comment_item(item)]
+        if normalized is not None
+    ][:limit]
+    return {
+        "status": "extracted",
+        "requested_count": limit,
+        "returned_count": len(items),
+        "source": "yt_dlp_python_api",
+        "items": items,
+        "interpretation_notes": [
+            "top comments are contextual signals, not representative sampling",
+            "comments are hints about visible audience context, not ground truth",
+        ],
+        "provenance": {
+            "method": "yt_dlp_getcomments",
+            "sort": "top",
+            "requested_limit": limit,
+            "trust": "contextual_signal_not_semantics",
+        },
+    }
+
+
+def run_comments_stage(
+    source: str,
+    *,
+    requested_count: int,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    count = max(0, int(requested_count))
+    if count <= 0:
+        return default_comments_payload(count)
+    if not is_youtube_url(source):
+        return default_comments_payload(count, status="not_applicable")
+    try:
+        return fetch_youtube_comments(
+            source,
+            requested_count=count,
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        payload = default_comments_payload(count, status="failed")
+        payload["error"] = str(exc)
+        return payload
+
+
 def download_youtube_subtitles(
     url: str,
     paths: AnalysisPaths,
@@ -1694,21 +2141,42 @@ def download_youtube_subtitles(
     )
 
 
+def youtube_format_selector(max_video_height: int | None) -> str | None:
+    if max_video_height is None:
+        return None
+    height = int(max_video_height)
+    return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+
+
 def download_youtube_media(
     url: str,
     paths: AnalysisPaths,
     *,
     metadata_hint: dict[str, Any] | None = None,
+    fetch_subtitles: bool = True,
+    max_video_height: int | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    report_progress(progress_callback, "transcript", "Fetching subtitle tracks")
-    try:
-        download_youtube_subtitles(url, paths, progress_callback=progress_callback)
-    except Exception:
-        # Subtitle retrieval is best-effort. If YouTube rate limits or rejects
-        # caption download, keep the pipeline alive and allow later fallback to
-        # Whisper after the video is downloaded.
-        if metadata_hint is not None:
+    if fetch_subtitles:
+        report_progress(progress_callback, "transcript", "Fetching subtitle tracks")
+        try:
+            download_youtube_subtitles(url, paths, progress_callback=progress_callback)
+        except Exception:
+            # Subtitle retrieval is best-effort. If YouTube rate limits or rejects
+            # caption download, keep the pipeline alive and allow later fallback to
+            # Whisper after the video is downloaded.
+            if metadata_hint is not None:
+                try:
+                    report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
+                    download_subtitle_from_metadata(
+                        metadata_hint,
+                        paths,
+                        source_url=url,
+                        progress_callback=progress_callback,
+                    )
+                except Exception:
+                    pass
+        if choose_subtitle_file(paths.subtitles_dir) is None and metadata_hint is not None:
             try:
                 report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
                 download_subtitle_from_metadata(
@@ -1719,17 +2187,6 @@ def download_youtube_media(
                 )
             except Exception:
                 pass
-    if choose_subtitle_file(paths.subtitles_dir) is None and metadata_hint is not None:
-        try:
-            report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
-            download_subtitle_from_metadata(
-                metadata_hint,
-                paths,
-                source_url=url,
-                progress_callback=progress_callback,
-            )
-        except Exception:
-            pass
     video_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -1741,6 +2198,9 @@ def download_youtube_media(
             "default": str(paths.video_dir / "source.%(ext)s"),
         },
     }
+    format_selector = youtube_format_selector(max_video_height)
+    if format_selector is not None:
+        video_opts["format"] = format_selector
     report_progress(progress_callback, "download", "Starting source media download")
     info = _run_yt_dlp_extract_info(
         video_opts,
@@ -1750,7 +2210,7 @@ def download_youtube_media(
         phase="download",
         retry_message="YouTube media download stalled",
     )
-    if choose_subtitle_file(paths.subtitles_dir) is None:
+    if fetch_subtitles and choose_subtitle_file(paths.subtitles_dir) is None:
         try:
             report_progress(progress_callback, "transcript", "Trying metadata subtitle fallback")
             download_subtitle_from_metadata(
@@ -1834,6 +2294,42 @@ def create_keyframes(
     return rows
 
 
+def visual_sampling_payload(
+    *,
+    intake_profile: str,
+    visual_density: str,
+    visuals_mode: str,
+    keyframe_mode: str,
+    interval_seconds: int,
+    scene_threshold: float,
+    candidate_frame_count: int,
+    visuals_payload: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    retained_slide_count = len(visuals_payload.get("slides", []))
+    retained_chart_count = len(visuals_payload.get("charts", []))
+    status = "extracted" if visuals_mode == "on" else "skipped"
+    return {
+        "status": status,
+        "profile": intake_profile,
+        "density": visual_density,
+        "keyframe_mode": keyframe_mode if visuals_mode == "on" else "off",
+        "interval_seconds": interval_seconds if keyframe_mode in {"interval", "scene+interval"} else None,
+        "scene_threshold": scene_threshold if keyframe_mode in {"scene", "scene+interval"} else None,
+        "candidate_frame_count": candidate_frame_count,
+        "retained_visual_count": retained_slide_count + retained_chart_count,
+        "retained_slide_count": retained_slide_count,
+        "retained_chart_count": retained_chart_count,
+        "provenance": {
+            "method": "local_keyframe_sampling_plus_heuristic_triage",
+            "trust": "sampling_signal_not_semantics",
+            "quality_notes": [
+                "visual sampling exposes evidence candidates, not complete visual understanding",
+                "retained visuals are heuristic promotions for downstream inspection",
+            ],
+        },
+    }
+
+
 def write_empty_stage_artifacts(paths: AnalysisPaths) -> None:
     paths.triage_frames_path.parent.mkdir(parents=True, exist_ok=True)
     paths.triage_segments_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1879,14 +2375,34 @@ def cleanup_non_debug_artifacts(paths: AnalysisPaths) -> None:
         path.unlink(missing_ok=True)
 
 
+def non_negative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return value
+
+
+def positive_int(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
 def analyze_source(
     source: str,
     *,
+    intake_profile: str = constants.DEFAULT_INTAKE_PROFILE,
     transcript_mode: str = "auto",
+    reuse_transcript: Path | None = None,
     keyframe_mode: str = "scene+interval",
     visuals_mode: str = constants.DEFAULT_VISUALS_MODE,
+    visual_density: str = constants.DEFAULT_VISUAL_DENSITY,
     ocr_mode: str = constants.DEFAULT_OCR_MODE,
     burned_subtitles_mode: str = constants.DEFAULT_BURNED_SUBTITLES_MODE,
+    audio_features_mode: str = constants.DEFAULT_AUDIO_FEATURES_MODE,
+    comments_count: int = constants.DEFAULT_COMMENTS_COUNT,
+    max_video_height: int | None = None,
     out_dir: Path | None = None,
     output_root_base: Path | None = None,
     interval_seconds: int = constants.DEFAULT_INTERVAL_SECONDS,
@@ -1922,12 +2438,28 @@ def analyze_source(
     transcript: dict[str, Any] | None = None
     ocr_state = default_ocr_state(ocr_mode)
     burned_subtitles_state = default_burned_subtitles_state(burned_subtitles_mode)
+    audio_features_payload = default_audio_features_payload(audio_features_mode)
+    comments_payload = default_comments_payload(comments_count)
     frames: list[dict[str, Any]] = []
     segments: list[dict[str, Any]] = []
     manifest_entries: list[dict[str, Any]] = []
     visuals_payload = visuals.empty_visuals_payload()
+    visual_sampling = visual_sampling_payload(
+        intake_profile=intake_profile,
+        visual_density=visual_density,
+        visuals_mode=visuals_mode,
+        keyframe_mode="off",
+        interval_seconds=interval_seconds,
+        scene_threshold=scene_threshold,
+        candidate_frame_count=0,
+        visuals_payload=visuals_payload,
+    )
     gpt_payload: dict[str, Any] | None = None
     errors: list[dict[str, Any]] = []
+    run_status = "failed"
+    pipeline_succeeded = False
+    reuse_transcript_path = Path(reuse_transcript).expanduser() if reuse_transcript is not None else None
+    should_fetch_subtitles = transcript_mode != "off" and reuse_transcript_path is None
 
     try:
         if looks_like_url(source):
@@ -1937,6 +2469,8 @@ def analyze_source(
                 source,
                 paths,
                 metadata_hint=metadata,
+                fetch_subtitles=should_fetch_subtitles,
+                max_video_height=max_video_height,
                 progress_callback=progress_callback,
             )
             audio_input = video_path
@@ -1947,80 +2481,88 @@ def analyze_source(
             metadata, video_path = materialize_local_input(source_path.resolve(), paths)
             audio_input = video_path or source_path.resolve()
 
-        subtitle_transcript = None
-        if transcript_mode in {"auto", "subtitles", "whisper", "api"}:
-            report_progress(progress_callback, "transcript", "Checking text-track subtitles")
-            subtitle_transcript = transcript_from_preferred_subtitles(paths)
-
-        burned_subtitle_transcript = None
-        if subtitle_transcript is None and transcript_mode in {"auto", "whisper", "api"}:
-            if burned_subtitles_mode == "off":
-                report_progress(progress_callback, "transcript", "Skipping burned subtitle OCR (disabled)")
-            else:
-                report_progress(
-                    progress_callback,
-                    "transcript",
-                    f"Trying burned subtitle OCR ({burned_subtitles_mode})",
-                )
-            burned_subtitle_transcript, burned_subtitles_state = run_burned_subtitles_stage(
-                video_path,
-                metadata,
-                paths,
-                mode=burned_subtitles_mode,
-            )
-
-        normalized_audio: Path | None = None
-        if (
-            subtitle_transcript is None
-            and burned_subtitle_transcript is None
-            and transcript_mode in {"auto", "whisper", "api"}
-        ):
-            report_progress(progress_callback, "audio", "Extracting normalized audio for transcription")
-            normalized_audio = extract_audio(audio_input, paths.audio_dir)
-
-        if transcript_mode == "auto":
-            if subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using text-track subtitles")
-                transcript = subtitle_transcript
-            elif burned_subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
-                transcript = burned_subtitle_transcript
-            else:
-                if progress_callback is None:
-                    transcript = transcript_strategy_auto(normalized_audio, paths)
-                else:
-                    transcript = transcript_strategy_auto(
-                        normalized_audio,
-                        paths,
-                        progress_callback=progress_callback,
-                    )
-        elif transcript_mode == "subtitles":
-            if subtitle_transcript is None:
-                raise FileNotFoundError("No subtitle file is available for transcript_mode=subtitles.")
-            report_progress(progress_callback, "transcript", "Using text-track subtitles")
-            transcript = subtitle_transcript
-        elif transcript_mode == "api":
-            if subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using text-track subtitles")
-                transcript = subtitle_transcript
-            elif burned_subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
-                transcript = burned_subtitle_transcript
-            else:
-                report_progress(progress_callback, "transcript", "Running OpenAI transcription")
-                transcript = transcribe_with_openai_skill(normalized_audio, paths)
-        elif transcript_mode == "whisper":
-            if subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using text-track subtitles")
-                transcript = subtitle_transcript
-            elif burned_subtitle_transcript is not None:
-                report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
-                transcript = burned_subtitle_transcript
-            else:
-                report_progress(progress_callback, "transcript", "Running local Whisper transcription")
-                transcript = transcribe_with_whisper(normalized_audio, paths)
+        if reuse_transcript_path is not None:
+            report_progress(progress_callback, "transcript", "Reusing existing transcript artifact")
+            transcript = load_reused_transcript(reuse_transcript_path, paths)
+        elif transcript_mode == "off":
+            report_progress(progress_callback, "transcript", "Skipping transcript extraction")
+            transcript = skipped_transcript()
+            write_transcript(paths, transcript)
         else:
-            raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
+            subtitle_transcript = None
+            if transcript_mode in {"auto", "subtitles", "whisper", "api"}:
+                report_progress(progress_callback, "transcript", "Checking text-track subtitles")
+                subtitle_transcript = transcript_from_preferred_subtitles(paths)
+
+            burned_subtitle_transcript = None
+            if subtitle_transcript is None and transcript_mode in {"auto", "whisper", "api"}:
+                if burned_subtitles_mode == "off":
+                    report_progress(progress_callback, "transcript", "Skipping burned subtitle OCR (disabled)")
+                else:
+                    report_progress(
+                        progress_callback,
+                        "transcript",
+                        f"Trying burned subtitle OCR ({burned_subtitles_mode})",
+                    )
+                burned_subtitle_transcript, burned_subtitles_state = run_burned_subtitles_stage(
+                    video_path,
+                    metadata,
+                    paths,
+                    mode=burned_subtitles_mode,
+                )
+
+            normalized_audio: Path | None = None
+            if (
+                subtitle_transcript is None
+                and burned_subtitle_transcript is None
+                and transcript_mode in {"auto", "whisper", "api"}
+            ):
+                report_progress(progress_callback, "audio", "Extracting normalized audio for transcription")
+                normalized_audio = extract_audio(audio_input, paths.audio_dir)
+
+            if transcript_mode == "auto":
+                if subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using text-track subtitles")
+                    transcript = subtitle_transcript
+                elif burned_subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
+                    transcript = burned_subtitle_transcript
+                else:
+                    if progress_callback is None:
+                        transcript = transcript_strategy_auto(normalized_audio, paths)
+                    else:
+                        transcript = transcript_strategy_auto(
+                            normalized_audio,
+                            paths,
+                            progress_callback=progress_callback,
+                        )
+            elif transcript_mode == "subtitles":
+                if subtitle_transcript is None:
+                    raise FileNotFoundError("No subtitle file is available for transcript_mode=subtitles.")
+                report_progress(progress_callback, "transcript", "Using text-track subtitles")
+                transcript = subtitle_transcript
+            elif transcript_mode == "api":
+                if subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using text-track subtitles")
+                    transcript = subtitle_transcript
+                elif burned_subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
+                    transcript = burned_subtitle_transcript
+                else:
+                    report_progress(progress_callback, "transcript", "Running OpenAI transcription")
+                    transcript = transcribe_with_openai_skill(normalized_audio, paths)
+            elif transcript_mode == "whisper":
+                if subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using text-track subtitles")
+                    transcript = subtitle_transcript
+                elif burned_subtitle_transcript is not None:
+                    report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
+                    transcript = burned_subtitle_transcript
+                else:
+                    report_progress(progress_callback, "transcript", "Running local Whisper transcription")
+                    transcript = transcribe_with_whisper(normalized_audio, paths)
+            else:
+                raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
 
         effective_keyframe_mode = keyframe_mode if visuals_mode == "on" else "off"
         if effective_keyframe_mode == "off":
@@ -2094,7 +2636,7 @@ def analyze_source(
 
         if gpt_mode == "on":
             approved_entries = [entry for entry in manifest_entries if entry.get("approved_for_gpt")]
-            if approved_entries or transcript.get("text", "").strip():
+            if approved_entries or (transcript or {}).get("text", "").strip():
                 report_progress(progress_callback, "gpt", "Running GPT analysis")
                 segment_analyses, final_report = gpt.analyze_segments(
                     paths.root,
@@ -2112,17 +2654,72 @@ def analyze_source(
                     "final_report": final_report,
                 }
 
+        if audio_features_mode == "on":
+            report_progress(progress_callback, "audio", "Extracting loudness and silence features")
+        audio_features_payload = run_audio_features_stage(
+            audio_input,
+            metadata,
+            mode=audio_features_mode,
+        )
+
+        if comments_count > 0:
+            report_progress(progress_callback, "comments", f"Fetching top {comments_count} comments")
+        comments_payload = run_comments_stage(
+            source,
+            requested_count=comments_count,
+            progress_callback=progress_callback,
+        )
+
+        visual_sampling = visual_sampling_payload(
+            intake_profile=intake_profile,
+            visual_density=visual_density,
+            visuals_mode=visuals_mode,
+            keyframe_mode=effective_keyframe_mode,
+            interval_seconds=interval_seconds,
+            scene_threshold=scene_threshold,
+            candidate_frame_count=len(keyframe_rows),
+            visuals_payload=visuals_payload,
+        )
+
+        pipeline_succeeded = True
         return paths.root
+    except KeyboardInterrupt:
+        run_status = "aborted"
+        error = {
+            "stage": "analyze",
+            "kind": "interrupted",
+            "message": "Analysis interrupted by user.",
+        }
+        errors.append(error)
+        save_error(paths, error["stage"], error["message"])
+        raise
     except Exception as exc:
+        run_status = "failed"
         error = {"stage": "analyze", "message": str(exc)}
         errors.append(error)
         save_error(paths, error["stage"], error["message"])
         raise
     finally:
+        cleanup_error: Exception | None = None
+        try:
+            if cleanup_intermediates:
+                report_progress(progress_callback, "cleanup", "Removing intermediate media artifacts")
+                cleanup_intermediate_artifacts(paths)
+            if artifacts_mode == "minimal":
+                report_progress(progress_callback, "cleanup", "Removing non-debug artifacts")
+                cleanup_non_debug_artifacts(paths)
+        except Exception as exc:
+            cleanup_error = exc
+            error = {"stage": "cleanup", "message": str(exc)}
+            errors.append(error)
+            save_error(paths, error["stage"], error["message"])
+            if pipeline_succeeded:
+                run_status = "failed"
+        else:
+            if pipeline_succeeded:
+                run_status = "completed"
+
         report_progress(progress_callback, "output", "Writing output bundle")
-        if cleanup_intermediates:
-            report_progress(progress_callback, "cleanup", "Removing intermediate media artifacts")
-            cleanup_intermediate_artifacts(paths)
         reporting.write_output_file(
             paths,
             source_input=source,
@@ -2131,20 +2728,28 @@ def analyze_source(
             metadata=metadata,
             transcript=transcript,
             ocr=ocr_state,
+            audio_features=audio_features_payload,
+            comments=comments_payload,
+            visual_sampling=visual_sampling,
             visuals_payload=visuals_payload,
             errors=errors,
+            run_status=run_status,
+            max_video_height=max_video_height,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
             visuals_mode=visuals_mode,
+            visual_density=visual_density,
             ocr_mode=ocr_mode,
             burned_subtitles=burned_subtitles_state,
+            audio_features_mode=audio_features_mode,
+            comments_count=comments_count,
+            intake_profile=intake_profile,
             gpt_mode=gpt_mode,
             artifacts_mode=artifacts_mode,
             gpt_payload=gpt_payload,
         )
-        if artifacts_mode == "minimal":
-            report_progress(progress_callback, "cleanup", "Removing non-debug artifacts")
-            cleanup_non_debug_artifacts(paths)
+        if cleanup_error is not None and pipeline_succeeded:
+            raise cleanup_error
 
 
 def add_analysis_arguments(
@@ -2156,9 +2761,15 @@ def add_analysis_arguments(
     if include_source:
         parser.add_argument("--source", required=True, help="YouTube URL or local media path")
     parser.add_argument(
+        "--intake-profile",
+        default=constants.DEFAULT_INTAKE_PROFILE,
+        choices=[constants.DEFAULT_INTAKE_PROFILE, constants.RICH_INTAKE_PROFILE],
+        help="Named intake profile (`rich` enables dense visual sampling, audio features, and top comments)",
+    )
+    parser.add_argument(
         "--transcript",
         default="auto",
-        choices=["auto", "subtitles", "api", "whisper"],
+        choices=["auto", "subtitles", "api", "whisper", "off"],
         help="Transcript strategy",
     )
     parser.add_argument(
@@ -2169,9 +2780,15 @@ def add_analysis_arguments(
     )
     parser.add_argument(
         "--visuals",
-        default=constants.DEFAULT_VISUALS_MODE,
+        default=None,
         choices=["off", "on"],
         help="Enable or disable the visual pipeline (keyframes, OCR, triage, and visual extraction)",
+    )
+    parser.add_argument(
+        "--visual-density",
+        default=None,
+        choices=list(constants.VISUAL_DENSITY_INTERVAL_SECONDS),
+        help="Named visual sampling density when interval seconds are not set",
     )
     parser.add_argument(
         "--ocr",
@@ -2184,6 +2801,23 @@ def add_analysis_arguments(
         default=constants.DEFAULT_BURNED_SUBTITLES_MODE,
         choices=["auto", "off", "on"],
         help="Fallback OCR for fixed burned-in CJK subtitle bands when no text-track subtitles exist",
+    )
+    parser.add_argument(
+        "--audio-features",
+        default=None,
+        choices=["off", "on"],
+        help="Extract optional loudness and silence structure signals",
+    )
+    parser.add_argument(
+        "--comments",
+        type=non_negative_int,
+        default=None,
+        help="Fetch up to N top YouTube comments as contextual hints (default off)",
+    )
+    parser.add_argument(
+        "--max-video-height",
+        type=positive_int,
+        help="Prefer downloaded YouTube video at or below this height (default: yt-dlp selection)",
     )
     parser.add_argument(
         "--triage",
@@ -2236,9 +2870,14 @@ def add_analysis_arguments(
             help="Override output directory (default: output/youtube/<video-id-or-stem>)",
         )
     parser.add_argument(
+        "--reuse-transcript",
+        type=Path,
+        help="Use an existing transcript JSON artifact instead of extracting a fresh transcript",
+    )
+    parser.add_argument(
         "--interval-seconds",
         type=int,
-        default=constants.DEFAULT_INTERVAL_SECONDS,
+        default=None,
         help=f"Interval seconds for supplemental keyframes (default: {constants.DEFAULT_INTERVAL_SECONDS})",
     )
     parser.add_argument(
@@ -2254,18 +2893,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze a YouTube URL or local media file into transcripts, keyframes, triage, and reports."
     )
+    add_version_argument(parser)
     add_analysis_arguments(parser)
     return parser.parse_args(argv)
 
 
 def analysis_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    intake_profile = args.intake_profile
+    is_rich = intake_profile == constants.RICH_INTAKE_PROFILE
+    visual_density = args.visual_density or (
+        constants.RICH_VISUAL_DENSITY if is_rich else constants.DEFAULT_VISUAL_DENSITY
+    )
+    interval_seconds = args.interval_seconds
+    if interval_seconds is None:
+        interval_seconds = constants.VISUAL_DENSITY_INTERVAL_SECONDS[visual_density]
+    visuals_mode = args.visuals or ("on" if is_rich else constants.DEFAULT_VISUALS_MODE)
+    audio_features_mode = args.audio_features or ("on" if is_rich else constants.DEFAULT_AUDIO_FEATURES_MODE)
+    comments_count = args.comments
+    if comments_count is None:
+        comments_count = constants.RICH_COMMENTS_COUNT if is_rich else constants.DEFAULT_COMMENTS_COUNT
     kwargs: dict[str, Any] = {
+        "intake_profile": intake_profile,
         "transcript_mode": args.transcript,
+        "reuse_transcript": args.reuse_transcript,
         "keyframe_mode": args.keyframes,
-        "visuals_mode": args.visuals,
+        "visuals_mode": visuals_mode,
+        "visual_density": visual_density,
         "ocr_mode": args.ocr,
         "burned_subtitles_mode": args.burned_subtitles,
-        "interval_seconds": args.interval_seconds,
+        "audio_features_mode": audio_features_mode,
+        "comments_count": comments_count,
+        "max_video_height": args.max_video_height,
+        "interval_seconds": interval_seconds,
         "scene_threshold": args.scene_threshold,
         "triage_mode": args.triage,
         "gpt_mode": args.gpt,

@@ -24,7 +24,9 @@ def empty_visuals_payload() -> dict[str, list[dict[str, Any]]]:
     return {"slides": [], "charts": []}
 
 
-def transcript_excerpt(text: str, *, limit: int = TRANSCRIPT_EXCERPT_LIMIT) -> str:
+def transcript_excerpt(text: str | None, *, limit: int = TRANSCRIPT_EXCERPT_LIMIT) -> str | None:
+    if text is None:
+        return None
     return str(text or "")[:limit].strip()
 
 

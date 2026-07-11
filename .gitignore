@@ -7,3 +7,14 @@ build/
 dist/
 output/
 .env
+.env.*
+!.env.example
+
+# Local assistant/runtime state and private working notes.
+.codex/
+AGENTS.md
+README.internal.md
+docs/mira-notes/
+docs/mira-topics/
+docs/plans/
+logs/operations/
