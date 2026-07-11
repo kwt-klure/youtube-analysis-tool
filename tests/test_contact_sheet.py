@@ -53,6 +53,56 @@ class ContactSheetCommandTests(unittest.TestCase):
 
 
 class ContactSheetCreationTests(unittest.TestCase):
+    def test_url_run_replaces_stale_contact_sheet_media_without_deleting_output_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "out"
+            video_dir = output_root / "video"
+            video_dir.mkdir(parents=True)
+            stale_video = video_dir / "source.avi"
+            stale_video.write_bytes(b"stale-video")
+            (output_root / "contact-sheet.jpg").write_bytes(b"stale-sheet")
+            (output_root / "contact-sheet.json").write_text("{}", encoding="utf-8")
+            output_json = output_root / "output.json"
+            output_json.write_text('{"keep": true}', encoding="utf-8")
+            downloaded_video = video_dir / "source.mp4"
+
+            def fake_download(_source, paths, **_kwargs):
+                self.assertFalse(stale_video.exists())
+                self.assertFalse((output_root / "contact-sheet.jpg").exists())
+                self.assertFalse((output_root / "contact-sheet.json").exists())
+                self.assertTrue(output_json.exists())
+                downloaded_video.write_bytes(b"new-video")
+                return {
+                    "format": {"duration": "1.0"},
+                    "streams": [{"codec_type": "video"}],
+                }, downloaded_video
+
+            def fake_run_command(command):
+                self.assertEqual(str(downloaded_video), command[command.index("-i") + 1])
+                Path(command[-1]).write_bytes(b"new-sheet")
+
+            with mock.patch.object(
+                contact_sheet.pipeline,
+                "fetch_youtube_metadata",
+                return_value={"id": "demo", "title": "Demo"},
+            ), mock.patch.object(
+                contact_sheet.pipeline,
+                "download_youtube_media",
+                side_effect=fake_download,
+            ), mock.patch.object(
+                contact_sheet.pipeline,
+                "run_command",
+                side_effect=fake_run_command,
+            ):
+                result = contact_sheet.create_contact_sheet(
+                    "https://youtu.be/demo",
+                    out_dir=output_root,
+                )
+
+            self.assertEqual(downloaded_video, result.video_path)
+            self.assertEqual(b"new-sheet", result.sheet_path.read_bytes())
+            self.assertEqual('{"keep": true}', output_json.read_text(encoding="utf-8"))
+
     def test_create_contact_sheet_for_local_source_writes_manifest_and_keeps_media(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
