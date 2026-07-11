@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
 
 from youtube_analysis_tool.pipeline import (
     analyze_source,
+    analysis_kwargs_from_args,
     analysis_paths,
     burned_subtitle_detection_roi,
     burned_subtitle_quality_is_insufficient,
@@ -45,12 +46,16 @@ from youtube_analysis_tool.pipeline import (
     parse_srt_or_vtt,
     preprocess_burned_subtitle_image,
     run_ocr_stage,
+    run_comments_stage,
     main,
     transcribe_burned_subtitles,
     transcript_from_subtitles,
     transcript_strategy_auto,
     transcript_from_segments,
     is_effective_burned_subtitle_text,
+    extract_audio_features,
+    fetch_youtube_comments,
+    youtube_format_selector,
 )
 from youtube_analysis_tool import constants
 
@@ -233,13 +238,72 @@ class MetadataShapeTests(unittest.TestCase):
         self.assertEqual(3, len(calls))
 
 
+class AudioFeatureTests(unittest.TestCase):
+    def test_extract_audio_features_builds_loudness_windows_and_silence_segments(self) -> None:
+        samples = numpy.array(
+            ([12000] * 10) + ([0] * 20) + ([24000] * 10),
+            dtype=numpy.int16,
+        )
+
+        completed = mock.Mock()
+        completed.stdout = samples.tobytes()
+
+        with mock.patch("youtube_analysis_tool.pipeline.subprocess.run", return_value=completed):
+            payload = extract_audio_features(
+                Path("/tmp/demo.mp4"),
+                metadata={"format": {"duration": "4"}},
+                sample_rate=10,
+                window_seconds=1,
+                silence_min_duration=1.0,
+            )
+
+        self.assertEqual("extracted", payload["status"])
+        self.assertEqual("local_ffmpeg_python_rms", payload["source"])
+        self.assertEqual(4.0, payload["summary"]["duration_seconds"])
+        self.assertAlmostEqual(0.5, payload["summary"]["silence_ratio"])
+        self.assertEqual(
+            [{"start": 1.0, "end": 3.0, "duration": 2.0}],
+            payload["silence_segments"],
+        )
+        self.assertEqual(4, len(payload["windows"]))
+        self.assertLessEqual(payload["windows"][1]["rms_db"], -99.0)
+        self.assertAlmostEqual(payload["summary"]["mean_loudness_db"], payload["summary"]["mean_dbfs"])
+        self.assertEqual("wide_or_high_contrast", payload["summary"]["dynamic_range_hint"])
+        self.assertTrue(payload["quiet_segments"])
+        self.assertTrue(payload["loud_segments"])
+        self.assertGreaterEqual(len(payload["large_changes"]), 2)
+        self.assertEqual(0.0, payload["large_changes"][0]["start"])
+        self.assertEqual(2.0, payload["large_changes"][0]["end"])
+        self.assertLess(payload["large_changes"][0]["to_dbfs"], payload["large_changes"][0]["from_dbfs"])
+        self.assertIn("structural evidence", payload["interpretation_warning"])
+        self.assertEqual("structural_signal_not_semantics", payload["provenance"]["trust"])
+
+
 class CliArgumentTests(unittest.TestCase):
+    def test_version_flag_prints_project_version_and_exits(self) -> None:
+        expected_version = next(
+            line.partition("=")[2].strip().strip('"')
+            for line in (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+            if line.startswith("version =")
+        )
+        stdout = io.StringIO()
+
+        with self.assertRaises(SystemExit) as context, mock.patch("sys.stdout", stdout):
+            parse_args(["--version"])
+
+        self.assertEqual(0, context.exception.code)
+        self.assertEqual(f"youtube-analysis-tool {expected_version}\n", stdout.getvalue())
+
     def test_new_cli_flags_have_expected_defaults(self) -> None:
         args = parse_args(["--source", "/tmp/demo.mp4"])
 
-        self.assertEqual("off", args.visuals)
+        self.assertEqual("default", args.intake_profile)
+        self.assertIsNone(args.visuals)
+        self.assertIsNone(args.visual_density)
         self.assertEqual("auto", args.ocr)
         self.assertEqual("off", args.burned_subtitles)
+        self.assertIsNone(args.audio_features)
+        self.assertIsNone(args.comments)
         self.assertEqual("on", args.triage)
         self.assertEqual("off", args.gpt)
         self.assertEqual("interactive", args.review)
@@ -248,6 +312,83 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual("minimal", args.artifacts)
         self.assertFalse(args.review_reset)
         self.assertFalse(args.keep_intermediates)
+        self.assertIsNone(args.max_video_height)
+
+    def test_transcript_off_and_reuse_transcript_flags_parse(self) -> None:
+        args = parse_args(
+            [
+                "--source",
+                "/tmp/demo.mp4",
+                "--transcript",
+                "off",
+                "--reuse-transcript",
+                "/tmp/transcript.json",
+            ]
+        )
+
+        self.assertEqual("off", args.transcript)
+        self.assertEqual(Path("/tmp/transcript.json"), args.reuse_transcript)
+
+        kwargs = analysis_kwargs_from_args(args)
+        self.assertEqual("off", kwargs["transcript_mode"])
+        self.assertEqual(Path("/tmp/transcript.json"), kwargs["reuse_transcript"])
+
+    def test_max_video_height_flag_parses_and_flows_to_analysis(self) -> None:
+        args = parse_args(
+            ["--source", "/tmp/demo.mp4", "--max-video-height", "720"]
+        )
+
+        self.assertEqual(720, args.max_video_height)
+        self.assertEqual(720, analysis_kwargs_from_args(args)["max_video_height"])
+
+    def test_default_profile_keeps_cheap_visuals_audio_and_comments_off(self) -> None:
+        args = parse_args(["--source", "/tmp/demo.mp4"])
+
+        kwargs = analysis_kwargs_from_args(args)
+
+        self.assertEqual("default", kwargs["intake_profile"])
+        self.assertEqual("off", kwargs["visuals_mode"])
+        self.assertEqual("default", kwargs["visual_density"])
+        self.assertEqual(constants.DEFAULT_INTERVAL_SECONDS, kwargs["interval_seconds"])
+        self.assertEqual("off", kwargs["audio_features_mode"])
+        self.assertEqual(0, kwargs["comments_count"])
+
+    def test_rich_profile_sets_dense_visuals_audio_and_comments(self) -> None:
+        args = parse_args(["--source", "/tmp/demo.mp4", "--intake-profile", "rich"])
+
+        kwargs = analysis_kwargs_from_args(args)
+
+        self.assertEqual("rich", kwargs["intake_profile"])
+        self.assertEqual("on", kwargs["visuals_mode"])
+        self.assertEqual("dense", kwargs["visual_density"])
+        self.assertEqual(15, kwargs["interval_seconds"])
+        self.assertEqual("on", kwargs["audio_features_mode"])
+        self.assertEqual(5, kwargs["comments_count"])
+
+    def test_explicit_density_and_interval_override_rich_profile(self) -> None:
+        args = parse_args(
+            [
+                "--source",
+                "/tmp/demo.mp4",
+                "--intake-profile",
+                "rich",
+                "--visual-density",
+                "medium",
+                "--interval-seconds",
+                "10",
+                "--comments",
+                "0",
+                "--audio-features",
+                "off",
+            ]
+        )
+
+        kwargs = analysis_kwargs_from_args(args)
+
+        self.assertEqual("medium", kwargs["visual_density"])
+        self.assertEqual(10, kwargs["interval_seconds"])
+        self.assertEqual("off", kwargs["audio_features_mode"])
+        self.assertEqual(0, kwargs["comments_count"])
 
     def test_main_wires_progress_to_stderr_without_polluting_stdout(self) -> None:
         stdout = io.StringIO()
@@ -268,6 +409,61 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("[transcript] Running local Whisper transcription", stderr.getvalue())
         self.assertEqual("/tmp/out\n", stdout.getvalue())
+
+
+class CommentsStageTests(unittest.TestCase):
+    def test_fetch_youtube_comments_uses_yt_dlp_python_api_with_comment_limits(self) -> None:
+        captured = {}
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                captured["opts"] = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                captured["url"] = url
+                captured["download"] = download
+                return {
+                    "comments": [
+                        {
+                            "id": "comment-1",
+                            "text": "Useful context",
+                            "like_count": 12,
+                            "reply_count": 2,
+                            "timestamp": 1710000000,
+                        }
+                    ]
+                }
+
+        with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL):
+            payload = fetch_youtube_comments("https://youtu.be/demo", requested_count=5)
+
+        self.assertEqual("https://youtu.be/demo", captured["url"])
+        self.assertFalse(captured["download"])
+        self.assertTrue(captured["opts"]["getcomments"])
+        self.assertEqual(["5"], captured["opts"]["extractor_args"]["youtube"]["max_comments"])
+        self.assertEqual(["top"], captured["opts"]["extractor_args"]["youtube"]["comment_sort"])
+        self.assertEqual("extracted", payload["status"])
+        self.assertEqual(1, payload["returned_count"])
+        self.assertEqual("Useful context", payload["items"][0]["text"])
+
+    def test_comments_stage_failure_is_non_fatal(self) -> None:
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.fetch_youtube_comments",
+            side_effect=RuntimeError("comments unavailable"),
+        ):
+            payload = run_comments_stage("https://youtu.be/demo", requested_count=5)
+
+        self.assertEqual("failed", payload["status"])
+        self.assertEqual(5, payload["requested_count"])
+        self.assertEqual(0, payload["returned_count"])
+        self.assertIn("comments unavailable", payload["error"])
+        self.assertIn("top comments are contextual signals", payload["interpretation_notes"][0])
 
 
 class DotenvLoadingTests(unittest.TestCase):
@@ -875,6 +1071,212 @@ class OcrModeTests(unittest.TestCase):
 
 
 class VisualsModeTests(unittest.TestCase):
+    def test_transcript_off_runs_visual_debug_without_audio_or_transcription(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+
+            def fake_create_keyframes(video_path, metadata, paths, **kwargs):
+                del video_path, metadata, kwargs
+                frame_path = paths.keyframes_dir / "slide.jpg"
+                frame_path.parent.mkdir(parents=True, exist_ok=True)
+                frame_path.write_bytes(b"slide-bytes")
+                return [
+                    {
+                        "kind": "scene",
+                        "filename": "slide.jpg",
+                        "timestamp_seconds": 0.0,
+                        "timestamp_hms": "00:00:00",
+                    }
+                ]
+
+            def fake_triage(output_root_path, keyframe_rows, ocr_rows, transcript):
+                del keyframe_rows, ocr_rows
+                self.assertEqual("skipped", transcript["source"])
+                frame = {
+                    "frame_id": "frame-00001",
+                    "frame_path": "keyframes/slide.jpg",
+                    "timestamp_seconds": 0.0,
+                    "timestamp_hms": "00:00:00",
+                    "ocr_text": "Slide text",
+                    "ocr_char_count": 10,
+                    "blur_score": 100.0,
+                }
+                segment = {
+                    "segment_id": "segment-0001",
+                    "heuristic_label": "slides",
+                    "heuristic_confidence": 0.9,
+                    "start_seconds": 0.0,
+                    "end_seconds": 0.0,
+                    "start_hms": "00:00:00",
+                    "end_hms": "00:00:00",
+                    "frame_ids": ["frame-00001"],
+                    "representative_frame_paths": ["keyframes/slide.jpg"],
+                    "ocr_summary": "Slide text",
+                    "ocr_char_count": 10,
+                    "transcript_window": {"text": None, "segments": []},
+                    "review_status": "auto_approved",
+                }
+                self.assertTrue((output_root_path / "keyframes" / "slide.jpg").exists())
+                return [frame], [segment]
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({"format": {"duration": "1"}, "streams": [{"codec_type": "video"}]}, source_path),
+            ), mock.patch("youtube_analysis_tool.pipeline.transcript_from_preferred_subtitles") as subtitle_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.run_burned_subtitles_stage"
+            ) as burned_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper"
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+            ) as openai_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                side_effect=fake_create_keyframes,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_ocr_stage",
+                return_value=(
+                    [{"filename": "slide.jpg", "timestamp_seconds": 0.0, "timestamp_hms": "00:00:00", "text": "Slide text"}],
+                    {"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
+                ),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.triage.run_local_triage",
+                side_effect=fake_triage,
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    transcript_mode="off",
+                    visuals_mode="on",
+                    artifacts_mode="debug",
+                )
+
+                written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+                manifest = json.loads((output_root / "visuals" / "manifest.json").read_text(encoding="utf-8"))
+
+        subtitle_mock.assert_not_called()
+        burned_mock.assert_not_called()
+        extract_audio_mock.assert_not_called()
+        whisper_mock.assert_not_called()
+        openai_mock.assert_not_called()
+        self.assertEqual("skipped", written["transcript"]["source"])
+        self.assertEqual("skipped", written["transcript"]["provenance"]["status"])
+        self.assertEqual("skipped", written["provenance"]["transcript"]["status"])
+        self.assertEqual("completed", written["processing"]["run_status"])
+        self.assertEqual("off", written["processing"]["transcript_mode"])
+        self.assertIsNone(written["visuals"]["slides"][0]["transcript_excerpt"])
+        self.assertEqual(1, len(manifest["slides"]))
+        self.assertFalse((output_root / "keyframes").exists())
+
+    def test_reuse_transcript_uses_existing_artifact_without_transcription(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_path = root / "demo.mp4"
+            source_path.write_bytes(b"video")
+            transcript_path = root / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "source": "whisper",
+                        "language": "en",
+                        "text": "Reused transcript line",
+                        "segments": [{"start": 0.0, "end": 5.0, "text": "Reused transcript line"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output_root = root / "out"
+
+            def fake_create_keyframes(video_path, metadata, paths, **kwargs):
+                del video_path, metadata, kwargs
+                frame_path = paths.keyframes_dir / "slide.jpg"
+                frame_path.parent.mkdir(parents=True, exist_ok=True)
+                frame_path.write_bytes(b"slide-bytes")
+                return [
+                    {
+                        "kind": "scene",
+                        "filename": "slide.jpg",
+                        "timestamp_seconds": 1.0,
+                        "timestamp_hms": "00:00:01",
+                    }
+                ]
+
+            def fake_triage(output_root_path, keyframe_rows, ocr_rows, transcript):
+                del output_root_path, keyframe_rows, ocr_rows
+                self.assertEqual("Reused transcript line", transcript["text"])
+                return [
+                    {
+                        "frame_id": "frame-00001",
+                        "frame_path": "keyframes/slide.jpg",
+                        "timestamp_seconds": 1.0,
+                        "timestamp_hms": "00:00:01",
+                        "ocr_text": "Slide text",
+                        "ocr_char_count": 10,
+                        "blur_score": 100.0,
+                    }
+                ], [
+                    {
+                        "segment_id": "segment-0001",
+                        "heuristic_label": "slides",
+                        "heuristic_confidence": 0.9,
+                        "start_seconds": 1.0,
+                        "end_seconds": 1.0,
+                        "start_hms": "00:00:01",
+                        "end_hms": "00:00:01",
+                        "frame_ids": ["frame-00001"],
+                        "representative_frame_paths": ["keyframes/slide.jpg"],
+                        "ocr_summary": "Slide text",
+                        "ocr_char_count": 10,
+                        "transcript_window": {"text": "Reused transcript line", "segments": transcript["segments"]},
+                        "review_status": "auto_approved",
+                    }
+                ]
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({"format": {"duration": "1"}, "streams": [{"codec_type": "video"}]}, source_path),
+            ), mock.patch("youtube_analysis_tool.pipeline.transcript_from_preferred_subtitles") as subtitle_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.extract_audio"
+            ) as extract_audio_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper"
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+            ) as openai_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                side_effect=fake_create_keyframes,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_ocr_stage",
+                return_value=(
+                    [{"filename": "slide.jpg", "timestamp_seconds": 1.0, "timestamp_hms": "00:00:01", "text": "Slide text"}],
+                    {"mode": "auto", "status": "completed", "attempted": True, "frame_count": 1, "error": None},
+                ),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.triage.run_local_triage",
+                side_effect=fake_triage,
+            ):
+                analyze_source(
+                    str(source_path),
+                    out_dir=output_root,
+                    reuse_transcript=transcript_path,
+                    visuals_mode="on",
+                    artifacts_mode="debug",
+                )
+
+                written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+
+        subtitle_mock.assert_not_called()
+        extract_audio_mock.assert_not_called()
+        whisper_mock.assert_not_called()
+        openai_mock.assert_not_called()
+        self.assertEqual("whisper", written["transcript"]["source"])
+        self.assertEqual("Reused transcript line", written["transcript"]["full_text"])
+        self.assertEqual("reused", written["transcript"]["provenance"]["status"])
+        self.assertEqual(str(transcript_path.resolve()), written["transcript"]["provenance"]["reused_from"])
+        self.assertEqual("reused", written["provenance"]["transcript"]["status"])
+        self.assertEqual("Reused transcript line", written["visuals"]["slides"][0]["transcript_excerpt"])
+
     def test_visuals_off_forces_keyframes_off_and_marks_processing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_path = Path(tmpdir) / "demo.mp4"
@@ -905,6 +1307,7 @@ class VisualsModeTests(unittest.TestCase):
                     out_dir=output_root,
                     transcript_mode="auto",
                     visuals_mode="off",
+                    max_video_height=720,
                     cleanup_intermediates=False,
                 )
 
@@ -912,8 +1315,99 @@ class VisualsModeTests(unittest.TestCase):
 
         self.assertEqual("off", keyframes_mock.call_args.kwargs["mode"])
         self.assertEqual("off", written["processing"]["visuals_mode"])
+        self.assertEqual(720, written["processing"]["requested_max_video_height"])
+        self.assertFalse(written["provenance"]["media"]["height_limit_applied"])
         self.assertEqual([], written["visuals"]["slides"])
         self.assertEqual([], written["visuals"]["charts"])
+
+    def test_stage_failure_writes_failed_partial_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({"streams": [{"codec_type": "video"}]}, source_path),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                side_effect=RuntimeError("visual stage failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "visual stage failed"):
+                    analyze_source(
+                        str(source_path),
+                        out_dir=output_root,
+                        transcript_mode="off",
+                        visuals_mode="on",
+                        cleanup_intermediates=False,
+                    )
+
+            written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("failed", written["processing"]["run_status"])
+        self.assertEqual(1, written["processing"]["counts"]["error_count"])
+        self.assertEqual("visual stage failed", written["errors"][0]["message"])
+
+    def test_keyboard_interrupt_writes_aborted_partial_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({"streams": [{"codec_type": "video"}]}, source_path),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                side_effect=KeyboardInterrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    analyze_source(
+                        str(source_path),
+                        out_dir=output_root,
+                        transcript_mode="off",
+                        visuals_mode="on",
+                        cleanup_intermediates=False,
+                    )
+
+            written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("aborted", written["processing"]["run_status"])
+        self.assertEqual(1, written["processing"]["counts"]["error_count"])
+        self.assertEqual("interrupted", written["errors"][0]["kind"])
+        self.assertEqual("Analysis interrupted by user.", written["errors"][0]["message"])
+
+    def test_cleanup_failure_writes_failed_partial_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.mp4"
+            source_path.write_bytes(b"video")
+            output_root = Path(tmpdir) / "out"
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.materialize_local_input",
+                return_value=({"streams": [{"codec_type": "video"}]}, source_path),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.create_keyframes",
+                return_value=[],
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.write_empty_stage_artifacts",
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.cleanup_intermediate_artifacts",
+                side_effect=RuntimeError("cleanup failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                    analyze_source(
+                        str(source_path),
+                        out_dir=output_root,
+                        transcript_mode="off",
+                        visuals_mode="off",
+                    )
+
+            written = json.loads((output_root / "output.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("failed", written["processing"]["run_status"])
+        self.assertEqual("cleanup", written["errors"][0]["stage"])
+        self.assertEqual("cleanup failed", written["errors"][0]["message"])
 
     def test_write_empty_stage_artifacts_creates_missing_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -932,6 +1426,13 @@ class VisualsModeTests(unittest.TestCase):
 
 
 class YoutubeDownloadFallbackTests(unittest.TestCase):
+    def test_youtube_format_selector_is_optional_and_height_bounded(self) -> None:
+        self.assertIsNone(youtube_format_selector(None))
+        self.assertEqual(
+            "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            youtube_format_selector(720),
+        )
+
     def test_preferred_subtitle_languages_follow_constants(self) -> None:
         self.assertEqual("zh-tw", preferred_subtitle_languages()[0])
 
@@ -1206,6 +1707,82 @@ class YoutubeDownloadFallbackTests(unittest.TestCase):
             self.assertTrue(video_path.exists())
             subtitle_path = paths.subtitles_dir / "demo-video.zh-TW.manual.vtt"
             self.assertTrue(subtitle_path.exists())
+
+    def test_download_youtube_media_can_skip_subtitle_fetch(self) -> None:
+        calls = []
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+                calls.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                return {"id": "demo-video"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL):
+                _, video_path = download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    fetch_subtitles=False,
+                )
+                video_exists = video_path.exists()
+
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("skip_download", calls[0])
+        self.assertNotIn("format", calls[0])
+        self.assertTrue(video_exists)
+
+    def test_download_youtube_media_applies_max_video_height(self) -> None:
+        calls = []
+
+        class FakeYoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+                calls.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download):
+                del url, download
+                default_template = self.opts["outtmpl"]["default"]
+                video_path = Path(default_template.replace("%(ext)s", "mp4"))
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                video_path.write_bytes(b"video")
+                return {"id": "demo-video"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            paths.video_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch("youtube_analysis_tool.pipeline.load_yt_dlp", return_value=FakeYoutubeDL):
+                download_youtube_media(
+                    "https://youtu.be/demo",
+                    paths,
+                    fetch_subtitles=False,
+                    max_video_height=720,
+                )
+
+        self.assertEqual(
+            "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            calls[0]["format"],
+        )
 
     def test_download_youtube_media_falls_back_to_post_download_info_for_auto_captions(self) -> None:
         class FakeYoutubeDL:

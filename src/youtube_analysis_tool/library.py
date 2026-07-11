@@ -7,12 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from . import constants
+from .version import add_version_argument
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Index, filter, and grep local youtube-analysis-tool output bundles."
     )
+    add_version_argument(parser)
     parser.add_argument(
         "--root",
         type=Path,

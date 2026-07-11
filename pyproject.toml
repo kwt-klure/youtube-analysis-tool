@@ -22,6 +22,7 @@ youtube = [
 youtube-analyze = "youtube_analysis_tool.pipeline:main"
 youtube-batch = "youtube_analysis_tool.batch:main"
 youtube-library = "youtube_analysis_tool.library:main"
+youtube-contact-sheet = "youtube_analysis_tool.contact_sheet:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

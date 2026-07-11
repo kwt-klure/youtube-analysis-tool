@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from .pipeline import (
     slugify,
     youtube_video_id_from_source,
 )
+from .version import add_version_argument
 
 
 def read_source_list(path: Path) -> list[str]:
@@ -46,9 +48,30 @@ def candidate_existing_outputs(source: str, *, root: Path) -> list[Path]:
     return candidates
 
 
+def is_completed_output_bundle(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    processing = payload.get("processing") or {}
+    if "run_status" in processing and processing.get("run_status") != "completed":
+        return False
+
+    errors = payload.get("errors") or []
+    if errors:
+        return False
+
+    transcript = payload.get("transcript") or {}
+    return bool(transcript.get("source"))
+
+
 def find_existing_output(source: str, *, root: Path) -> Path | None:
     candidates = candidate_existing_outputs(source, root=root)
-    return candidates[0] if candidates else None
+    for candidate in candidates:
+        if is_completed_output_bundle(candidate):
+            return candidate
+    return None
 
 
 def build_batch_report(
@@ -83,6 +106,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run youtube-analysis-tool over a newline-separated source list."
     )
+    add_version_argument(parser)
     parser.add_argument(
         "--source-list",
         required=True,

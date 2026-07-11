@@ -249,11 +249,11 @@ def collect_transcript_window(
     start_seconds: float,
     end_seconds: float,
 ) -> dict[str, Any]:
-    if not transcript:
+    if not transcript or transcript.get("source") == "skipped":
         return {
             "start_seconds": round(start_seconds, 3),
             "end_seconds": round(end_seconds, 3),
-            "text": "",
+            "text": None,
             "segments": [],
         }
     padding = constants.DEFAULT_TRANSCRIPT_CONTEXT_PADDING_SECONDS
