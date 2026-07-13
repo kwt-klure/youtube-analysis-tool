@@ -17,6 +17,9 @@ youtube = [
   "pytesseract",
   "yt-dlp",
 ]
+mlx-whisper = [
+  "mlx-whisper>=0.4.3,<0.5",
+]
 
 [project.scripts]
 youtube-analyze = "youtube_analysis_tool.pipeline:main"

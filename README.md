@@ -41,6 +41,17 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[youtube]'
 ```
 
+The OpenAI Whisper CLI is the default local ASR backend. Apple Silicon users
+can optionally install MLX Whisper:
+
+```bash
+.venv/bin/python -m pip install -e '.[youtube,mlx-whisper]'
+```
+
+MLX is opt-in and uses the same Whisper `base` model family through
+`mlx-community/whisper-base-mlx`. Its first run downloads the converted model
+from Hugging Face.
+
 Available commands:
 
 - `youtube-analyze`
@@ -86,6 +97,20 @@ youtube-analyze \
 
 Usable subtitle tracks take priority. If none are available, the automatic
 strategy falls back to local Whisper and then optional API transcription.
+
+### MLX Whisper
+
+Select MLX Whisper explicitly on Apple Silicon:
+
+```bash
+youtube-analyze \
+  --source /path/to/video.mp4 \
+  --transcript whisper \
+  --local-asr-backend mlx-whisper
+```
+
+`openai-whisper` remains the default backend. Explicit MLX selection fails
+clearly when unavailable and never silently uses remote ASR.
 
 ### Visual Evidence
 
@@ -198,13 +223,13 @@ sheet manifests record the same information.
 
 ## Output Contract
 
-The current output schema version is `1.0.10`.
+The current output schema version is `1.0.11`.
 
 Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.10",
+  "output_version": "1.0.11",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -257,8 +282,9 @@ include:
 - optional remote ASR
 - reused or intentionally skipped transcript state
 
-Interpretation hints identify text that should be checked carefully for names,
-numbers, or exact wording.
+Local Whisper provenance records the selected backend and model. Interpretation
+hints identify text that should be checked carefully for names, numbers, or
+exact wording.
 
 ### Visuals
 

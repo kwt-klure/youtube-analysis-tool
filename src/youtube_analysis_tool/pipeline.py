@@ -1046,6 +1046,11 @@ def normalize_reused_transcript_payload(payload: dict[str, Any], source_path: Pa
     transcript["text"] = text or ""
     transcript["segments"] = segments
     transcript["segment_count"] = transcript_payload.get("segment_count", len(segments))
+    provenance = transcript_payload.get("provenance")
+    if isinstance(provenance, dict):
+        for key in ("backend", "model"):
+            if not transcript.get(key) and provenance.get(key):
+                transcript[key] = provenance[key]
     transcript["status"] = "reused"
     transcript["reused_from"] = str(source_path)
     return transcript
@@ -1617,7 +1622,7 @@ def run_burned_subtitles_stage(
 
 
 def extract_audio(input_media_path: Path, audio_dir: Path) -> Path:
-    audio_path = audio_dir / "source.wav"
+    audio_path = audio_dir / "normalized.wav"
     run_command(
         [
             "ffmpeg",
@@ -1683,10 +1688,34 @@ def transcribe_with_openai_skill(audio_path: Path, paths: AnalysisPaths) -> dict
     return transcript
 
 
-def transcribe_with_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+def transcript_from_local_asr_payload(
+    payload: dict[str, Any],
+    audio_path: Path,
+    paths: AnalysisPaths,
+    *,
+    backend: str,
+    model: str,
+) -> dict[str, Any]:
+    transcript = {
+        "source": "whisper",
+        "backend": backend,
+        "model": model,
+        "language": payload.get("language"),
+        "source_path": str(audio_path.relative_to(paths.root)),
+        "segment_count": len(payload.get("segments") or []),
+        "text": extract_text_from_transcript_payload(payload),
+        "segments": payload.get("segments") or [],
+        "raw": payload,
+    }
+    write_transcript(paths, transcript)
+    return transcript
+
+
+def transcribe_with_openai_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
     whisper_bin, command_env = resolve_command("whisper")
     if whisper_bin is None:
         raise FileNotFoundError("whisper command is not available.")
+    model = constants.LOCAL_ASR_MODELS[constants.DEFAULT_LOCAL_ASR_BACKEND]
     temp_dir = paths.root / "tmp-whisper"
     temp_dir.mkdir(parents=True, exist_ok=True)
     env = build_command_env(command_env)
@@ -1696,7 +1725,7 @@ def transcribe_with_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str,
         whisper_bin,
         str(audio_path),
         "--model",
-        "base",
+        model,
         "--task",
         "transcribe",
         "--output_format",
@@ -1707,18 +1736,69 @@ def transcribe_with_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str,
     run_command(command, env=env)
     json_path = temp_dir / f"{audio_path.stem}.json"
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    transcript = {
-        "source": "whisper",
-        "language": payload.get("language"),
-        "source_path": str(audio_path.relative_to(paths.root)),
-        "segment_count": len(payload.get("segments") or []),
-        "text": extract_text_from_transcript_payload(payload),
-        "segments": payload.get("segments") or [],
-        "raw": payload,
-    }
-    write_transcript(paths, transcript)
+    transcript = transcript_from_local_asr_payload(
+        payload,
+        audio_path,
+        paths,
+        backend=constants.DEFAULT_LOCAL_ASR_BACKEND,
+        model=model,
+    )
     shutil.rmtree(temp_dir, ignore_errors=True)
     return transcript
+
+
+def transcribe_with_mlx_whisper(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+    mlx_whisper_bin, command_env = resolve_command("mlx_whisper")
+    if mlx_whisper_bin is None:
+        raise FileNotFoundError(
+            "mlx_whisper command is not available. Install the optional `mlx-whisper` dependency."
+        )
+    model = constants.LOCAL_ASR_MODELS["mlx-whisper"]
+    temp_dir = paths.root / "tmp-whisper"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        mlx_whisper_bin,
+        str(audio_path),
+        "--model",
+        model,
+        "--task",
+        "transcribe",
+        "--output-format",
+        "json",
+        "--output-dir",
+        str(temp_dir),
+        "--verbose",
+        "False",
+    ]
+    run_command(command, env=build_command_env(command_env))
+    json_path = temp_dir / f"{audio_path.stem}.json"
+    if not json_path.exists():
+        raise FileNotFoundError(
+            f"mlx_whisper did not write the expected JSON transcript: {json_path}"
+        )
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    transcript = transcript_from_local_asr_payload(
+        payload,
+        audio_path,
+        paths,
+        backend="mlx-whisper",
+        model=model,
+    )
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return transcript
+
+
+def transcribe_with_whisper(
+    audio_path: Path,
+    paths: AnalysisPaths,
+    *,
+    backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
+) -> dict[str, Any]:
+    if backend == constants.DEFAULT_LOCAL_ASR_BACKEND:
+        return transcribe_with_openai_whisper(audio_path, paths)
+    if backend == "mlx-whisper":
+        return transcribe_with_mlx_whisper(audio_path, paths)
+    raise ValueError(f"Unsupported local ASR backend: {backend}")
 
 
 def select_filter_expression(threshold: float) -> str:
@@ -2247,15 +2327,25 @@ def transcript_strategy_auto(
     audio_path: Path,
     paths: AnalysisPaths,
     *,
+    local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     subtitle_transcript = transcript_from_preferred_subtitles(paths)
     if subtitle_transcript is not None:
         return subtitle_transcript
-    report_progress(progress_callback, "transcript", "Running local Whisper transcription")
+    report_progress(
+        progress_callback,
+        "transcript",
+        f"Running local Whisper transcription ({local_asr_backend})",
+    )
     try:
-        return transcribe_with_whisper(audio_path, paths)
-    except Exception:
+        return transcribe_with_whisper(audio_path, paths, backend=local_asr_backend)
+    except Exception as exc:
+        if local_asr_backend != constants.DEFAULT_LOCAL_ASR_BACKEND:
+            raise RuntimeError(
+                f"Local ASR backend {local_asr_backend} failed: {exc}. "
+                "Remote fallback is disabled for explicit backend selection."
+            ) from exc
         report_progress(
             progress_callback,
             "transcript",
@@ -2402,6 +2492,7 @@ def analyze_source(
     burned_subtitles_mode: str = constants.DEFAULT_BURNED_SUBTITLES_MODE,
     audio_features_mode: str = constants.DEFAULT_AUDIO_FEATURES_MODE,
     comments_count: int = constants.DEFAULT_COMMENTS_COUNT,
+    local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
     max_video_height: int | None = None,
     out_dir: Path | None = None,
     output_root_base: Path | None = None,
@@ -2529,11 +2620,16 @@ def analyze_source(
                     transcript = burned_subtitle_transcript
                 else:
                     if progress_callback is None:
-                        transcript = transcript_strategy_auto(normalized_audio, paths)
+                        transcript = transcript_strategy_auto(
+                            normalized_audio,
+                            paths,
+                            local_asr_backend=local_asr_backend,
+                        )
                     else:
                         transcript = transcript_strategy_auto(
                             normalized_audio,
                             paths,
+                            local_asr_backend=local_asr_backend,
                             progress_callback=progress_callback,
                         )
             elif transcript_mode == "subtitles":
@@ -2559,8 +2655,16 @@ def analyze_source(
                     report_progress(progress_callback, "transcript", "Using burned subtitle OCR transcript")
                     transcript = burned_subtitle_transcript
                 else:
-                    report_progress(progress_callback, "transcript", "Running local Whisper transcription")
-                    transcript = transcribe_with_whisper(normalized_audio, paths)
+                    report_progress(
+                        progress_callback,
+                        "transcript",
+                        f"Running local Whisper transcription ({local_asr_backend})",
+                    )
+                    transcript = transcribe_with_whisper(
+                        normalized_audio,
+                        paths,
+                        backend=local_asr_backend,
+                    )
             else:
                 raise ValueError(f"Unsupported transcript mode: {transcript_mode}")
 
@@ -2737,6 +2841,7 @@ def analyze_source(
             max_video_height=max_video_height,
             cleanup_intermediates=cleanup_intermediates,
             transcript_mode=transcript_mode,
+            local_asr_backend=local_asr_backend,
             visuals_mode=visuals_mode,
             visual_density=visual_density,
             ocr_mode=ocr_mode,
@@ -2771,6 +2876,12 @@ def add_analysis_arguments(
         default="auto",
         choices=["auto", "subtitles", "api", "whisper", "off"],
         help="Transcript strategy",
+    )
+    parser.add_argument(
+        "--local-asr-backend",
+        default=constants.DEFAULT_LOCAL_ASR_BACKEND,
+        choices=list(constants.LOCAL_ASR_BACKENDS),
+        help="Local Whisper backend used by auto/whisper transcript modes",
     )
     parser.add_argument(
         "--keyframes",
@@ -2915,6 +3026,7 @@ def analysis_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "intake_profile": intake_profile,
         "transcript_mode": args.transcript,
+        "local_asr_backend": args.local_asr_backend,
         "reuse_transcript": args.reuse_transcript,
         "keyframe_mode": args.keyframes,
         "visuals_mode": visuals_mode,

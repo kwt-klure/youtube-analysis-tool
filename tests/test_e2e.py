@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from youtube_analysis_tool import pipeline, triage as triage_module
+from youtube_analysis_tool import constants, pipeline, triage as triage_module
 from youtube_analysis_tool.artifacts import write_json
 
 
@@ -69,7 +69,15 @@ class EndToEndPipelineTests(unittest.TestCase):
             audio_path.write_bytes(b"audio")
             return audio_path
 
-        def fake_transcript_strategy_auto(_: Path, paths: pipeline.AnalysisPaths) -> dict[str, object]:
+        def fake_transcript_strategy_auto(
+            _: Path,
+            paths: pipeline.AnalysisPaths,
+            *,
+            local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
+            progress_callback=None,
+        ) -> dict[str, object]:
+            del progress_callback
+            self.assertEqual(constants.DEFAULT_LOCAL_ASR_BACKEND, local_asr_backend)
             transcript = pipeline.transcript_from_segments(
                 transcript_segments or [{"start": 0.0, "end": 4.0, "text": "Demo transcript"}],
                 source="subtitle",

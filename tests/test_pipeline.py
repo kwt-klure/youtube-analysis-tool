@@ -35,11 +35,14 @@ from youtube_analysis_tool.pipeline import (
     download_youtube_media,
     download_youtube_subtitles,
     duration_seconds,
+    extract_audio,
     extract_interval_keyframes,
     fetch_youtube_metadata,
     find_dotenv_path,
+    load_reused_transcript,
     load_dotenv_file,
     load_local_env,
+    link_local_source,
     parse_args,
     parse_subtitle_file,
     preferred_subtitle_languages,
@@ -49,6 +52,7 @@ from youtube_analysis_tool.pipeline import (
     run_comments_stage,
     main,
     transcribe_burned_subtitles,
+    transcribe_with_whisper,
     transcript_from_subtitles,
     transcript_strategy_auto,
     transcript_from_segments,
@@ -239,6 +243,23 @@ class MetadataShapeTests(unittest.TestCase):
 
 
 class AudioFeatureTests(unittest.TestCase):
+    def test_extract_audio_uses_a_distinct_path_for_local_wav_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "demo.wav"
+            source_path.write_bytes(b"original audio")
+            audio_dir = Path(tmpdir) / "out" / "audio"
+            audio_dir.mkdir(parents=True)
+            linked_source = link_local_source(source_path, audio_dir)
+
+            with mock.patch("youtube_analysis_tool.pipeline.run_command") as run_command:
+                normalized_audio = extract_audio(source_path, audio_dir)
+            source_bytes_after = source_path.read_bytes()
+
+        self.assertEqual(audio_dir / "normalized.wav", normalized_audio)
+        self.assertNotEqual(linked_source, normalized_audio)
+        self.assertEqual(str(normalized_audio), run_command.call_args.args[0][-1])
+        self.assertEqual(b"original audio", source_bytes_after)
+
     def test_extract_audio_features_builds_loudness_windows_and_silence_segments(self) -> None:
         samples = numpy.array(
             ([12000] * 10) + ([0] * 20) + ([24000] * 10),
@@ -313,6 +334,7 @@ class CliArgumentTests(unittest.TestCase):
         self.assertFalse(args.review_reset)
         self.assertFalse(args.keep_intermediates)
         self.assertIsNone(args.max_video_height)
+        self.assertEqual(constants.DEFAULT_LOCAL_ASR_BACKEND, args.local_asr_backend)
 
     def test_transcript_off_and_reuse_transcript_flags_parse(self) -> None:
         args = parse_args(
@@ -340,6 +362,17 @@ class CliArgumentTests(unittest.TestCase):
 
         self.assertEqual(720, args.max_video_height)
         self.assertEqual(720, analysis_kwargs_from_args(args)["max_video_height"])
+
+    def test_local_asr_backend_flag_parses_and_flows_to_analysis(self) -> None:
+        args = parse_args(
+            ["--source", "/tmp/demo.mp4", "--local-asr-backend", "mlx-whisper"]
+        )
+
+        self.assertEqual("mlx-whisper", args.local_asr_backend)
+        self.assertEqual(
+            "mlx-whisper",
+            analysis_kwargs_from_args(args)["local_asr_backend"],
+        )
 
     def test_default_profile_keeps_cheap_visuals_audio_and_comments_off(self) -> None:
         args = parse_args(["--source", "/tmp/demo.mp4"])
@@ -409,6 +442,133 @@ class CliArgumentTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertIn("[transcript] Running local Whisper transcription", stderr.getvalue())
         self.assertEqual("/tmp/out\n", stdout.getvalue())
+
+
+class LocalAsrBackendTests(unittest.TestCase):
+    def test_default_dispatch_uses_openai_whisper_adapter(self) -> None:
+        expected = {"source": "whisper", "text": "hello", "segments": []}
+
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.transcribe_with_openai_whisper",
+            return_value=expected,
+        ) as openai_adapter, mock.patch(
+            "youtube_analysis_tool.pipeline.transcribe_with_mlx_whisper"
+        ) as mlx_adapter:
+            result = transcribe_with_whisper(
+                Path("/tmp/audio.wav"),
+                analysis_paths(Path("/tmp/out")),
+            )
+
+        self.assertEqual(expected, result)
+        openai_adapter.assert_called_once()
+        mlx_adapter.assert_not_called()
+
+    def test_mlx_adapter_reads_json_and_records_backend_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir) / "out")
+            paths.audio_dir.mkdir(parents=True)
+            audio_path = paths.audio_dir / "normalized.wav"
+            audio_path.write_bytes(b"audio")
+            captured_command: list[str] = []
+
+            def fake_run_command(command, env=None):
+                del env
+                captured_command.extend(command)
+                temp_dir = paths.root / "tmp-whisper"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                (temp_dir / "normalized.json").write_text(
+                    json.dumps(
+                        {
+                            "text": "MLX transcript",
+                            "language": "en",
+                            "segments": [
+                                {"start": 0.0, "end": 1.0, "text": "MLX transcript"}
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.resolve_command",
+                return_value=("/tmp/mlx_whisper", None),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.run_command",
+                side_effect=fake_run_command,
+            ):
+                result = transcribe_with_whisper(
+                    audio_path,
+                    paths,
+                    backend="mlx-whisper",
+                )
+
+        self.assertEqual("whisper", result["source"])
+        self.assertEqual("mlx-whisper", result["backend"])
+        self.assertEqual("mlx-community/whisper-base-mlx", result["model"])
+        self.assertEqual("MLX transcript", result["text"])
+        self.assertIn("--output-format", captured_command)
+        self.assertIn("--output-dir", captured_command)
+        self.assertIn("mlx-community/whisper-base-mlx", captured_command)
+
+    def test_missing_mlx_backend_fails_clearly(self) -> None:
+        with mock.patch(
+            "youtube_analysis_tool.pipeline.resolve_command",
+            return_value=(None, None),
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "mlx_whisper command is not available"):
+                transcribe_with_whisper(
+                    Path("/tmp/audio.wav"),
+                    analysis_paths(Path("/tmp/out")),
+                    backend="mlx-whisper",
+                )
+
+    def test_explicit_mlx_auto_mode_does_not_fall_back_to_remote_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir) / "out")
+            paths.subtitles_dir.mkdir(parents=True)
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper",
+                side_effect=FileNotFoundError("mlx missing"),
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+            ) as remote_adapter:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "mlx missing.*Remote fallback is disabled",
+                ):
+                    transcript_strategy_auto(
+                        Path("/tmp/audio.wav"),
+                        paths,
+                        local_asr_backend="mlx-whisper",
+                    )
+
+        remote_adapter.assert_not_called()
+
+    def test_reused_output_preserves_nested_local_asr_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "output.json"
+            paths = analysis_paths(Path(tmpdir) / "reused")
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "transcript": {
+                            "source": "whisper",
+                            "full_text": "MLX transcript",
+                            "segments": [],
+                            "provenance": {
+                                "backend": "mlx-whisper",
+                                "model": "mlx-community/whisper-base-mlx",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            transcript = load_reused_transcript(source_path, paths)
+
+        self.assertEqual("mlx-whisper", transcript["backend"])
+        self.assertEqual("mlx-community/whisper-base-mlx", transcript["model"])
 
 
 class CommentsStageTests(unittest.TestCase):
@@ -819,11 +979,13 @@ class TranscriptPolicyTests(unittest.TestCase):
                     str(source_path),
                     out_dir=output_root,
                     transcript_mode="whisper",
+                    local_asr_backend="mlx-whisper",
                     cleanup_intermediates=False,
                 )
 
         extract_audio_mock.assert_called_once()
         whisper_mock.assert_called_once()
+        self.assertEqual("mlx-whisper", whisper_mock.call_args.kwargs["backend"])
 
     def test_api_mode_uses_burned_subtitle_ocr_before_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

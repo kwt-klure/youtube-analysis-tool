@@ -248,6 +248,10 @@ def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[s
         provenance["reused_from"] = transcript["reused_from"]
     if transcript.get("skip_reason"):
         provenance["skip_reason"] = transcript["skip_reason"]
+    if transcript.get("backend"):
+        provenance["backend"] = transcript["backend"]
+    if transcript.get("model"):
+        provenance["model"] = transcript["model"]
     return provenance
 
 
@@ -472,6 +476,7 @@ def summarize_processing(
     cleanup_intermediates: bool,
     intake_profile: str,
     transcript_mode: str,
+    local_asr_backend: str,
     visuals_mode: str,
     visual_density: str,
     ocr_mode: str,
@@ -486,6 +491,7 @@ def summarize_processing(
         "requested_max_video_height": max_video_height,
         "intake_profile": intake_profile,
         "transcript_mode": transcript_mode,
+        "requested_local_asr_backend": local_asr_backend,
         "visuals_mode": visuals_mode,
         "visual_density": visual_density,
         "ocr_mode": ocr_mode,
@@ -538,6 +544,7 @@ def build_output_payload(
     visual_sampling: dict[str, Any] | None = None,
     run_status: str = "completed",
     max_video_height: int | None = None,
+    local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_visuals = normalize_visuals_payload(visuals_payload)
@@ -581,6 +588,7 @@ def build_output_payload(
             cleanup_intermediates=cleanup_intermediates,
             intake_profile=intake_profile,
             transcript_mode=transcript_mode,
+            local_asr_backend=local_asr_backend,
             visuals_mode=visuals_mode,
             visual_density=visual_density,
             ocr_mode=ocr_mode,
@@ -634,6 +642,7 @@ def write_output_file(
     visual_sampling: dict[str, Any] | None = None,
     run_status: str = "completed",
     max_video_height: int | None = None,
+    local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = build_output_payload(
@@ -654,6 +663,7 @@ def write_output_file(
         cleanup_intermediates=cleanup_intermediates,
         intake_profile=intake_profile,
         transcript_mode=transcript_mode,
+        local_asr_backend=local_asr_backend,
         visuals_mode=visuals_mode,
         visual_density=visual_density,
         ocr_mode=ocr_mode,

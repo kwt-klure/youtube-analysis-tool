@@ -463,6 +463,8 @@ class OutputBundleTests(unittest.TestCase):
                 metadata={"id": "demo", "title": "Demo"},
                 transcript={
                     "source": "whisper",
+                    "backend": "mlx-whisper",
+                    "model": "mlx-community/whisper-base-mlx",
                     "language": "zh",
                     "text": "逐字稿內容",
                     "segments": [{"start": 0.0, "end": 1.0, "text": "逐字稿內容"}],
@@ -473,6 +475,7 @@ class OutputBundleTests(unittest.TestCase):
                 errors=[],
                 cleanup_intermediates=True,
                 transcript_mode="whisper",
+                local_asr_backend="mlx-whisper",
                 visuals_mode="off",
                 ocr_mode="off",
                 gpt_mode="off",
@@ -487,6 +490,13 @@ class OutputBundleTests(unittest.TestCase):
             },
             payload["transcript"]["interpretation"],
         )
+        self.assertEqual("mlx-whisper", payload["transcript"]["provenance"]["backend"])
+        self.assertEqual(
+            "mlx-community/whisper-base-mlx",
+            payload["transcript"]["provenance"]["model"],
+        )
+        self.assertEqual("mlx-whisper", payload["provenance"]["transcript"]["backend"])
+        self.assertEqual("mlx-whisper", payload["processing"]["requested_local_asr_backend"])
         self.assertEqual("skipped", payload["provenance"]["visuals"]["selection_kind"])
 
     def test_output_json_downgrades_auto_caption_interpretation_when_overlap_is_heavy(self) -> None:
