@@ -48,10 +48,12 @@ from youtube_analysis_tool.pipeline import (
     preferred_subtitle_languages,
     parse_srt_or_vtt,
     preprocess_burned_subtitle_image,
+    resolve_command,
     run_ocr_stage,
     run_comments_stage,
     main,
     transcribe_burned_subtitles,
+    transcribe_with_openai_api,
     transcribe_with_whisper,
     transcript_from_subtitles,
     transcript_strategy_auto,
@@ -62,6 +64,27 @@ from youtube_analysis_tool.pipeline import (
     youtube_format_selector,
 )
 from youtube_analysis_tool import constants
+
+
+class CommandResolutionTests(unittest.TestCase):
+    def test_resolve_command_finds_script_next_to_active_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bin_dir = Path(tmpdir) / "bin"
+            bin_dir.mkdir()
+            python_path = bin_dir / "python"
+            command_path = bin_dir / "mlx_whisper"
+            command_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            command_path.chmod(0o755)
+
+            with mock.patch.object(sys, "executable", str(python_path)), mock.patch.dict(
+                os.environ,
+                {"PATH": ""},
+                clear=True,
+            ):
+                resolved, env = resolve_command("mlx_whisper")
+
+        self.assertEqual(str(command_path), resolved)
+        self.assertEqual(str(bin_dir), env["PATH"].split(os.pathsep)[0])
 
 
 class SubtitleParsingTests(unittest.TestCase):
@@ -530,7 +553,7 @@ class LocalAsrBackendTests(unittest.TestCase):
                 "youtube_analysis_tool.pipeline.transcribe_with_whisper",
                 side_effect=FileNotFoundError("mlx missing"),
             ), mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as remote_adapter:
                 with self.assertRaisesRegex(
                     RuntimeError,
@@ -569,6 +592,64 @@ class LocalAsrBackendTests(unittest.TestCase):
 
         self.assertEqual("mlx-whisper", transcript["backend"])
         self.assertEqual("mlx-community/whisper-base-mlx", transcript["model"])
+
+
+class RemoteAsrBackendTests(unittest.TestCase):
+    def test_openai_api_adapter_writes_verbose_transcript_with_provenance(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def model_dump(self, *, mode: str) -> dict[str, object]:
+                captured["dump_mode"] = mode
+                return {
+                    "text": "API transcript",
+                    "language": "en",
+                    "segments": [
+                        {"start": 0.0, "end": 1.0, "text": "API transcript"}
+                    ],
+                }
+
+        class FakeTranscriptions:
+            def create(self, **kwargs: object) -> FakeResponse:
+                captured.update(kwargs)
+                return FakeResponse()
+
+        class FakeClient:
+            audio = type("Audio", (), {"transcriptions": FakeTranscriptions()})()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir) / "out")
+            paths.audio_dir.mkdir(parents=True)
+            audio_path = paths.audio_dir / "normalized.wav"
+            audio_path.write_bytes(b"audio")
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), mock.patch(
+                "youtube_analysis_tool.pipeline.create_openai_client",
+                return_value=FakeClient(),
+            ) as client_factory:
+                transcript = transcribe_with_openai_api(audio_path, paths)
+
+            written = json.loads(paths.transcript_json_path.read_text(encoding="utf-8"))
+
+        client_factory.assert_called_once_with("test-key")
+        self.assertEqual("whisper-1", captured["model"])
+        self.assertEqual("verbose_json", captured["response_format"])
+        self.assertEqual(["segment"], captured["timestamp_granularities"])
+        self.assertEqual("json", captured["dump_mode"])
+        self.assertEqual("openai-api", transcript["backend"])
+        self.assertEqual("whisper-1", transcript["model"])
+        self.assertEqual("API transcript", written["text"])
+
+    def test_openai_api_adapter_requires_key_before_importing_sdk(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "youtube_analysis_tool.pipeline.create_openai_client"
+        ) as client_factory:
+            with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY is not set"):
+                transcribe_with_openai_api(
+                    Path("/tmp/audio.wav"),
+                    analysis_paths(Path("/tmp/out")),
+                )
+
+        client_factory.assert_not_called()
 
 
 class CommentsStageTests(unittest.TestCase):
@@ -681,7 +762,7 @@ class TranscriptPolicyTests(unittest.TestCase):
             ) as subtitle_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.transcribe_with_whisper"
             ) as whisper_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as openai_mock:
                 result = transcript_strategy_auto(Path("/tmp/audio.wav"), paths)
 
@@ -695,18 +776,63 @@ class TranscriptPolicyTests(unittest.TestCase):
             paths = analysis_paths(Path(tmpdir))
             transcript = {"source": "openai", "text": "API"}
 
-            with mock.patch("youtube_analysis_tool.pipeline.choose_subtitle_file", return_value=None), mock.patch(
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
                 "youtube_analysis_tool.pipeline.transcribe_with_whisper",
                 side_effect=RuntimeError("whisper unavailable"),
             ) as whisper_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill",
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api",
                 return_value=transcript,
             ) as openai_mock:
                 result = transcript_strategy_auto(Path("/tmp/audio.wav"), paths)
 
         self.assertEqual(transcript, result)
-        whisper_mock.assert_called_once()
+        self.assertEqual(2, whisper_mock.call_count)
         openai_mock.assert_called_once()
+
+    def test_transcript_auto_recovers_on_single_local_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+            transcript = {"source": "whisper", "text": "local retry"}
+
+            with mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper",
+                side_effect=[RuntimeError("temporary failure"), transcript],
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
+            ) as openai_mock:
+                result = transcript_strategy_auto(Path("/tmp/audio.wav"), paths)
+
+        self.assertEqual(transcript, result)
+        self.assertEqual(2, whisper_mock.call_count)
+        openai_mock.assert_not_called()
+
+    def test_transcript_auto_preserves_local_failures_when_remote_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = analysis_paths(Path(tmpdir))
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "youtube_analysis_tool.pipeline.choose_subtitle_file",
+                return_value=None,
+            ), mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_whisper",
+                side_effect=[RuntimeError("first failure"), RuntimeError("second failure")],
+            ) as whisper_mock, mock.patch(
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
+            ) as openai_mock:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "failed twice.*OPENAI_API_KEY.*first failure.*second failure",
+                ):
+                    transcript_strategy_auto(Path("/tmp/audio.wav"), paths)
+
+        self.assertEqual(2, whisper_mock.call_count)
+        openai_mock.assert_not_called()
 
     def test_whisper_mode_still_prefers_subtitles_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -801,7 +927,7 @@ class TranscriptPolicyTests(unittest.TestCase):
                 "youtube_analysis_tool.pipeline.transcript_from_subtitles",
                 return_value=transcript,
             ) as subtitle_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as openai_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.create_keyframes",
                 return_value=[],
@@ -1016,7 +1142,7 @@ class TranscriptPolicyTests(unittest.TestCase):
             ), mock.patch(
                 "youtube_analysis_tool.pipeline.extract_audio"
             ) as extract_audio_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as openai_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.create_keyframes",
                 return_value=[],
@@ -1293,7 +1419,7 @@ class VisualsModeTests(unittest.TestCase):
             ) as extract_audio_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.transcribe_with_whisper"
             ) as whisper_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as openai_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.create_keyframes",
                 side_effect=fake_create_keyframes,
@@ -1404,7 +1530,7 @@ class VisualsModeTests(unittest.TestCase):
             ) as extract_audio_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.transcribe_with_whisper"
             ) as whisper_mock, mock.patch(
-                "youtube_analysis_tool.pipeline.transcribe_with_openai_skill"
+                "youtube_analysis_tool.pipeline.transcribe_with_openai_api"
             ) as openai_mock, mock.patch(
                 "youtube_analysis_tool.pipeline.create_keyframes",
                 side_effect=fake_create_keyframes,

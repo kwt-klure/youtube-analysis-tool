@@ -96,7 +96,10 @@ youtube-analyze \
 ```
 
 Usable subtitle tracks take priority. If none are available, the automatic
-strategy falls back to local Whisper and then optional API transcription.
+strategy runs local Whisper, retries it once after a transient failure, and
+only then uses optional OpenAI API transcription when `OPENAI_API_KEY` is set.
+The API path uses the installed OpenAI SDK directly and does not depend on a
+global Codex skill.
 
 ### MLX Whisper
 

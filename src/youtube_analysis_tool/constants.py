@@ -46,6 +46,7 @@ LOCAL_ASR_MODELS = {
     DEFAULT_LOCAL_ASR_BACKEND: "base",
     "mlx-whisper": "mlx-community/whisper-base-mlx",
 }
+DEFAULT_REMOTE_ASR_MODEL = "whisper-1"
 RICH_INTAKE_PROFILE = "rich"
 RICH_VISUAL_DENSITY = "dense"
 RICH_COMMENTS_COUNT = 5

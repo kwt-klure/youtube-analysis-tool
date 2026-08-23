@@ -89,6 +89,9 @@ def build_command_env(overrides: dict[str, str] | None = None) -> dict[str, str]
     for directory in reversed(PREFERRED_COMMAND_DIRS):
         if directory not in entries and Path(directory).exists():
             entries.insert(0, directory)
+    interpreter_dir = str(Path(sys.executable).parent)
+    if interpreter_dir not in entries:
+        entries.insert(0, interpreter_dir)
     env["PATH"] = os.pathsep.join(entries)
     return env
 
@@ -1640,14 +1643,6 @@ def extract_audio(input_media_path: Path, audio_dir: Path) -> Path:
     return audio_path
 
 
-def codex_home() -> Path:
-    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-
-
-def transcribe_skill_script() -> Path:
-    return codex_home() / "skills" / "transcribe" / "scripts" / "transcribe_diarize.py"
-
-
 def extract_text_from_transcript_payload(payload: dict[str, Any]) -> str:
     if isinstance(payload.get("text"), str):
         return payload["text"].strip()
@@ -1655,28 +1650,45 @@ def extract_text_from_transcript_payload(payload: dict[str, Any]) -> str:
     return "\n".join(segment.get("text", "").strip() for segment in segments if segment.get("text"))
 
 
-def transcribe_with_openai_skill(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
-    script_path = transcribe_skill_script()
-    if not script_path.exists():
-        raise FileNotFoundError(f"Transcribe skill is not installed: {script_path}")
-    if not os.getenv("OPENAI_API_KEY"):
+def create_openai_client(api_key: str) -> Any:
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "The optional `openai` package is required for API transcription."
+        ) from exc
+    return OpenAI(api_key=api_key)
+
+
+def openai_response_payload(response: Any) -> dict[str, Any]:
+    if hasattr(response, "model_dump"):
+        payload = response.model_dump(mode="json")
+    elif isinstance(response, dict):
+        payload = response
+    else:
+        raise TypeError("OpenAI transcription returned an unsupported response type.")
+    if not isinstance(payload, dict):
+        raise TypeError("OpenAI transcription response did not serialize to an object.")
+    return payload
+
+
+def transcribe_with_openai_api(audio_path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set for API transcription.")
-    temp_json = paths.root / "transcript.openai.json"
-    run_command(
-        [
-            sys.executable,
-            str(script_path),
-            str(audio_path),
-            "--response-format",
-            "json",
-            "--out",
-            str(temp_json),
-        ]
-    )
-    payload = json.loads(temp_json.read_text(encoding="utf-8"))
-    temp_json.unlink(missing_ok=True)
+    client = create_openai_client(api_key)
+    with audio_path.open("rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            file=audio_file,
+            model=constants.DEFAULT_REMOTE_ASR_MODEL,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+    payload = openai_response_payload(response)
     transcript = {
         "source": "openai",
+        "backend": "openai-api",
+        "model": constants.DEFAULT_REMOTE_ASR_MODEL,
         "language": payload.get("language"),
         "source_path": str(audio_path.relative_to(paths.root)),
         "segment_count": len(payload.get("segments") or []),
@@ -1686,6 +1698,17 @@ def transcribe_with_openai_skill(audio_path: Path, paths: AnalysisPaths) -> dict
     }
     write_transcript(paths, transcript)
     return transcript
+
+
+def command_failure_detail(exc: subprocess.CalledProcessError) -> str:
+    detail = ""
+    for value in (exc.stderr, exc.stdout):
+        if isinstance(value, str) and value.strip():
+            detail = value.strip()
+            break
+    if len(detail) > 2000:
+        detail = detail[-2000:]
+    return detail or str(exc)
 
 
 def transcript_from_local_asr_payload(
@@ -1717,6 +1740,7 @@ def transcribe_with_openai_whisper(audio_path: Path, paths: AnalysisPaths) -> di
         raise FileNotFoundError("whisper command is not available.")
     model = constants.LOCAL_ASR_MODELS[constants.DEFAULT_LOCAL_ASR_BACKEND]
     temp_dir = paths.root / "tmp-whisper"
+    shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     env = build_command_env(command_env)
     env.setdefault("OMP_NUM_THREADS", "1")
@@ -1733,7 +1757,12 @@ def transcribe_with_openai_whisper(audio_path: Path, paths: AnalysisPaths) -> di
         "--output_dir",
         str(temp_dir),
     ]
-    run_command(command, env=env)
+    try:
+        run_command(command, env=env)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"OpenAI Whisper command failed: {command_failure_detail(exc)}"
+        ) from exc
     json_path = temp_dir / f"{audio_path.stem}.json"
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     transcript = transcript_from_local_asr_payload(
@@ -2338,20 +2367,47 @@ def transcript_strategy_auto(
         "transcript",
         f"Running local Whisper transcription ({local_asr_backend})",
     )
-    try:
-        return transcribe_with_whisper(audio_path, paths, backend=local_asr_backend)
-    except Exception as exc:
-        if local_asr_backend != constants.DEFAULT_LOCAL_ASR_BACKEND:
+    if local_asr_backend != constants.DEFAULT_LOCAL_ASR_BACKEND:
+        try:
+            return transcribe_with_whisper(audio_path, paths, backend=local_asr_backend)
+        except Exception as exc:
             raise RuntimeError(
                 f"Local ASR backend {local_asr_backend} failed: {exc}. "
                 "Remote fallback is disabled for explicit backend selection."
             ) from exc
-        report_progress(
-            progress_callback,
-            "transcript",
-            "Local Whisper failed; falling back to OpenAI transcription",
-        )
-        return transcribe_with_openai_skill(audio_path, paths)
+
+    local_failures: list[Exception] = []
+    for attempt in range(2):
+        try:
+            return transcribe_with_whisper(audio_path, paths, backend=local_asr_backend)
+        except Exception as exc:
+            local_failures.append(exc)
+            if attempt == 0:
+                report_progress(
+                    progress_callback,
+                    "transcript",
+                    "Local Whisper failed; retrying once",
+                )
+
+    failure_summary = " | ".join(str(exc) for exc in local_failures)
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "Local Whisper failed twice and OPENAI_API_KEY is not set; "
+            f"remote fallback is unavailable. Failures: {failure_summary}"
+        ) from local_failures[-1]
+
+    report_progress(
+        progress_callback,
+        "transcript",
+        "Local Whisper failed twice; falling back to OpenAI transcription",
+    )
+    try:
+        return transcribe_with_openai_api(audio_path, paths)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Local Whisper failed twice ({failure_summary}); "
+            f"OpenAI transcription also failed: {exc}"
+        ) from exc
 
 
 def create_keyframes(
@@ -2646,7 +2702,7 @@ def analyze_source(
                     transcript = burned_subtitle_transcript
                 else:
                     report_progress(progress_callback, "transcript", "Running OpenAI transcription")
-                    transcript = transcribe_with_openai_skill(normalized_audio, paths)
+                    transcript = transcribe_with_openai_api(normalized_audio, paths)
             elif transcript_mode == "whisper":
                 if subtitle_transcript is not None:
                     report_progress(progress_callback, "transcript", "Using text-track subtitles")
