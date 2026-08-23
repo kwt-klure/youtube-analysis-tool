@@ -16,8 +16,8 @@ workflow.
    running a concrete lane.
 3. Select the narrowest lane that can answer the request.
 4. Run local extraction before considering GPT.
-5. Verify process exit, JSON parseability, run status, and errors before using
-   an analysis bundle as evidence.
+5. Verify process exit and run the repo-owned bundle checker before using an
+   analysis bundle as evidence.
 6. Read the relevant provenance and evidence-sufficiency fields.
 7. Clean temporary outputs according to the selected lane.
 
@@ -33,8 +33,8 @@ workflow.
   independently material.
 
 Start bounded visual evidence passes with interval-only frames, a conservative
-interval, 720p media, and OCR off. Enable OCR only when selected frames actually
-need text extraction.
+interval, a 36-frame pre-OCR cap, 720p media, and OCR off. Enable OCR only when
+selected frames actually need text extraction.
 
 ## Success Gate
 
@@ -48,6 +48,16 @@ Treat `output.json` as completed evidence only when all are true:
 Treat `failed` and `aborted` bundles as diagnostic partial output. Never infer
 success merely because `output.json` exists.
 
+Use the machine-readable gate after each analysis run:
+
+```bash
+.venv/bin/python scripts/youtube_bundle_check.py \
+  '<fresh-output-dir>/output.json' \
+  --json
+```
+
+The checker must exit zero and report `"valid": true`.
+
 ## Local-First Boundary
 
 Use local subtitles, Whisper, ffmpeg, OCR, triage, and provenance before remote
@@ -59,5 +69,7 @@ evidence cannot supply. Do not send the full video or bulk frame set to GPT.
 - `youtube-analysis-tool` is executable truth.
 - This repo-owned skill is the canonical processing workflow.
 - The installed runtime skill is a deployed copy and should match this folder.
+- Use `youtube-skill-sync --check --json` to detect drift; installation is an
+  explicit, backed-up action.
 - `youtube-intake` owns conversational evidence escalation and optional
   archival routing.

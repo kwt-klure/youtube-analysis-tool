@@ -15,10 +15,13 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 
 
 def package_version() -> str:
+    source_version = pyproject_version()
+    if source_version is not None:
+        return source_version
     try:
         return metadata.version(PROJECT_NAME)
     except metadata.PackageNotFoundError:
-        return pyproject_version() or UNKNOWN_VERSION
+        return UNKNOWN_VERSION
 
 
 def add_version_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

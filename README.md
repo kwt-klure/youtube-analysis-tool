@@ -58,6 +58,7 @@ Available commands:
 - `youtube-batch`
 - `youtube-library`
 - `youtube-contact-sheet`
+- `youtube-bundle-check`
 
 All commands support `--version`.
 
@@ -122,12 +123,15 @@ Enable keyframes, OCR, triage, and retained visual output:
 ```bash
 youtube-analyze \
   --source 'https://www.youtube.com/watch?v=VIDEO_ID' \
-  --visuals on
+  --visuals on \
+  --max-frames 36
 ```
 
 Available density presets are `default`, `medium`, and `dense`, corresponding
 to 60, 30, and 15 second interval sampling. `--interval-seconds` overrides the
-preset.
+preset. `--max-frames` is optional; when present, cheap pHash and sharpness
+signals remove duplicate candidates before an evenly distributed subset enters
+OCR and triage. Omitting the flag preserves uncapped behavior.
 
 ### Visual-Only
 
@@ -155,6 +159,7 @@ youtube-analyze \
   --visuals on \
   --keyframes interval \
   --interval-seconds 60 \
+  --max-frames 36 \
   --ocr off \
   --max-video-height 720 \
   --audio-features off \
@@ -226,13 +231,13 @@ sheet manifests record the same information.
 
 ## Output Contract
 
-The current output schema version is `1.0.11`.
+The current output schema version is `1.0.12`.
 
 Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.11",
+  "output_version": "1.0.12",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -269,6 +274,16 @@ Possible run states are:
 - `failed`: a processing or cleanup stage raised an error
 - `aborted`: the run was interrupted, such as with `Ctrl-C`
 
+Verify an existing bundle with the same completion contract used by automated
+workers and skills:
+
+```bash
+youtube-bundle-check /path/to/output.json --json
+```
+
+The checker exits nonzero for malformed bundles, missing run status, failed or
+aborted runs, and fatal errors.
+
 Batch processing uses this field for new bundles and retains compatibility with
 older bundles that predate it.
 
@@ -294,6 +309,12 @@ exact wording.
 Retained slides and charts include timing, OCR summary, nearby transcript text,
 an embedded primary image, and selection provenance. Local labels are routing
 heuristics rather than semantic guarantees.
+
+`visual_sampling` reports raw candidate, pre-OCR deduplicated, selected, and
+retained visual counts. Debug runs also preserve `visuals/selection.json` so a
+frame can be traced as selected, duplicate, or over budget. Capped debug runs
+keep selected candidate images under `visuals/candidates/` even when OCR is off
+and local triage does not promote them as slides or charts.
 
 ### Run Reflection
 
@@ -410,6 +431,19 @@ Check patch whitespace before committing:
 
 ```bash
 git diff --check
+```
+
+Check whether the repo-owned processing skill matches its installed runtime
+copy without writing anything:
+
+```bash
+youtube-skill-sync --check --json
+```
+
+Install it explicitly with a verified runtime backup:
+
+```bash
+youtube-skill-sync --install --json
 ```
 
 The repository also includes a Codex-compatible processing skill under

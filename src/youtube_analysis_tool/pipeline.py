@@ -117,6 +117,7 @@ class AnalysisPaths:
     transcript_text_path: Path
     transcript_json_path: Path
     keyframe_index_path: Path
+    visual_selection_path: Path
     metadata_path: Path
     source_path: Path
     error_path: Path
@@ -264,6 +265,7 @@ def analysis_paths(root: Path) -> AnalysisPaths:
         transcript_text_path=root / "transcript.txt",
         transcript_json_path=root / "transcript.json",
         keyframe_index_path=root / "keyframes" / "index.csv",
+        visual_selection_path=root / "visuals" / "selection.json",
         metadata_path=root / "metadata.json",
         source_path=root / "source.txt",
         error_path=root / "error.json",
@@ -2440,6 +2442,185 @@ def create_keyframes(
     return rows
 
 
+@dataclass(frozen=True)
+class KeyframeSelection:
+    rows: list[dict[str, Any]]
+    candidate_count: int
+    deduplicated_count: int
+    selected_count: int
+    max_frames: int | None
+    method: str
+    entries: list[dict[str, Any]]
+
+
+def evenly_spaced_indices(total: int, limit: int) -> list[int]:
+    if total <= 0 or limit <= 0:
+        return []
+    if limit >= total:
+        return list(range(total))
+    if limit == 1:
+        return [0]
+    return [round(index * (total - 1) / (limit - 1)) for index in range(limit)]
+
+
+def select_keyframes_for_processing(
+    keyframe_rows: list[dict[str, Any]],
+    paths: AnalysisPaths,
+    *,
+    max_frames: int | None,
+) -> KeyframeSelection:
+    ordered_rows = sorted(keyframe_rows, key=lambda row: float(row["timestamp_seconds"]))
+    if max_frames is None:
+        entries = [
+            {
+                **row,
+                "selected": True,
+                "selection_reason": "uncapped",
+                "duplicate_group": None,
+                "representative_filename": row["filename"],
+            }
+            for row in ordered_rows
+        ]
+        selection = KeyframeSelection(
+            rows=ordered_rows,
+            candidate_count=len(ordered_rows),
+            deduplicated_count=len(ordered_rows),
+            selected_count=len(ordered_rows),
+            max_frames=None,
+            method="uncapped",
+            entries=entries,
+        )
+    else:
+        candidates: list[dict[str, Any]] = []
+        groups: list[dict[str, Any]] = []
+        for row in ordered_rows:
+            frame_path = paths.keyframes_dir / str(row["filename"])
+            matrix = triage.read_grayscale_image(frame_path)
+            candidate = {
+                "row": row,
+                "phash": triage.compute_phash(matrix, frame_path),
+                "blur_score": triage.compute_blur_score(matrix),
+            }
+            selected_group: dict[str, Any] | None = None
+            for group in groups:
+                if (
+                    triage.hamming_distance(candidate["phash"], group["reference_phash"])
+                    <= constants.DEFAULT_PHASH_DUPLICATE_DISTANCE
+                ):
+                    selected_group = group
+                    break
+            if selected_group is None:
+                selected_group = {
+                    "group_id": f"pre-dup-{len(groups) + 1:04d}",
+                    "reference_phash": candidate["phash"],
+                    "members": [],
+                }
+                groups.append(selected_group)
+            selected_group["members"].append(candidate)
+            candidate["duplicate_group"] = selected_group["group_id"]
+            candidates.append(candidate)
+
+        representatives: list[dict[str, Any]] = []
+        representative_by_group: dict[str, dict[str, Any]] = {}
+        for group in groups:
+            representative = max(
+                group["members"],
+                key=lambda item: (
+                    float(item["blur_score"]),
+                    -float(item["row"]["timestamp_seconds"]),
+                ),
+            )
+            representatives.append(representative)
+            representative_by_group[group["group_id"]] = representative
+        representatives.sort(key=lambda item: float(item["row"]["timestamp_seconds"]))
+
+        selected_indices = set(evenly_spaced_indices(len(representatives), max_frames))
+        selected_representatives = [
+            representative
+            for index, representative in enumerate(representatives)
+            if index in selected_indices
+        ]
+        selected_filenames = {
+            str(representative["row"]["filename"])
+            for representative in selected_representatives
+        }
+        entries = []
+        for candidate in candidates:
+            row = candidate["row"]
+            group_id = str(candidate["duplicate_group"])
+            representative = representative_by_group[group_id]
+            filename = str(row["filename"])
+            representative_filename = str(representative["row"]["filename"])
+            if filename != representative_filename:
+                reason = "duplicate"
+            elif filename in selected_filenames:
+                reason = "selected"
+            else:
+                reason = "over_budget"
+            entries.append(
+                {
+                    **row,
+                    "phash": candidate["phash"],
+                    "blur_score": candidate["blur_score"],
+                    "duplicate_group": group_id,
+                    "representative_filename": representative_filename,
+                    "selected": reason == "selected",
+                    "selection_reason": reason,
+                }
+            )
+        selection = KeyframeSelection(
+            rows=[representative["row"] for representative in selected_representatives],
+            candidate_count=len(ordered_rows),
+            deduplicated_count=len(representatives),
+            selected_count=len(selected_representatives),
+            max_frames=max_frames,
+            method="phash_sharpest_then_even_timeline",
+            entries=entries,
+        )
+
+    write_json(
+        paths.visual_selection_path,
+        {
+            "candidate_frame_count": selection.candidate_count,
+            "deduplicated_frame_count": selection.deduplicated_count,
+            "selected_frame_count": selection.selected_count,
+            "max_frames": selection.max_frames,
+            "selection_method": selection.method,
+            "frames": selection.entries,
+        },
+    )
+    return selection
+
+
+def save_debug_selected_keyframes(
+    paths: AnalysisPaths,
+    selection: KeyframeSelection,
+) -> None:
+    candidates_dir = paths.visuals_dir / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    for entry in selection.entries:
+        entry["debug_image_path"] = None
+        if not entry.get("selected"):
+            continue
+        source_path = paths.keyframes_dir / str(entry["filename"])
+        if not source_path.is_file():
+            continue
+        target_path = candidates_dir / source_path.name
+        shutil.copy2(source_path, target_path)
+        entry["debug_image_path"] = str(target_path.relative_to(paths.root))
+    write_json(
+        paths.visual_selection_path,
+        {
+            "candidate_frame_count": selection.candidate_count,
+            "deduplicated_frame_count": selection.deduplicated_count,
+            "selected_frame_count": selection.selected_count,
+            "max_frames": selection.max_frames,
+            "selection_method": selection.method,
+            "frames": selection.entries,
+        },
+    )
+
+
 def visual_sampling_payload(
     *,
     intake_profile: str,
@@ -2449,6 +2630,10 @@ def visual_sampling_payload(
     interval_seconds: int,
     scene_threshold: float,
     candidate_frame_count: int,
+    deduplicated_frame_count: int,
+    selected_frame_count: int,
+    max_frames: int | None,
+    selection_method: str,
     visuals_payload: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
     retained_slide_count = len(visuals_payload.get("slides", []))
@@ -2462,6 +2647,10 @@ def visual_sampling_payload(
         "interval_seconds": interval_seconds if keyframe_mode in {"interval", "scene+interval"} else None,
         "scene_threshold": scene_threshold if keyframe_mode in {"scene", "scene+interval"} else None,
         "candidate_frame_count": candidate_frame_count,
+        "deduplicated_frame_count": deduplicated_frame_count,
+        "selected_frame_count": selected_frame_count,
+        "max_frames": max_frames,
+        "selection_method": selection_method,
         "retained_visual_count": retained_slide_count + retained_chart_count,
         "retained_slide_count": retained_slide_count,
         "retained_chart_count": retained_chart_count,
@@ -2550,6 +2739,7 @@ def analyze_source(
     comments_count: int = constants.DEFAULT_COMMENTS_COUNT,
     local_asr_backend: str = constants.DEFAULT_LOCAL_ASR_BACKEND,
     max_video_height: int | None = None,
+    max_frames: int | None = None,
     out_dir: Path | None = None,
     output_root_base: Path | None = None,
     interval_seconds: int = constants.DEFAULT_INTERVAL_SECONDS,
@@ -2599,6 +2789,10 @@ def analyze_source(
         interval_seconds=interval_seconds,
         scene_threshold=scene_threshold,
         candidate_frame_count=0,
+        deduplicated_frame_count=0,
+        selected_frame_count=0,
+        max_frames=max_frames,
+        selection_method="not_run",
         visuals_payload=visuals_payload,
     )
     gpt_payload: dict[str, Any] | None = None
@@ -2738,21 +2932,34 @@ def analyze_source(
             interval_seconds=interval_seconds,
             threshold=scene_threshold,
         )
+        keyframe_selection = select_keyframes_for_processing(
+            keyframe_rows,
+            paths,
+            max_frames=max_frames,
+        )
+        if artifacts_mode == "debug" and max_frames is not None:
+            save_debug_selected_keyframes(paths, keyframe_selection)
+        selected_keyframe_rows = keyframe_selection.rows
 
         try:
-            if keyframe_rows and ocr_mode != "off":
+            if selected_keyframe_rows and ocr_mode != "off":
                 report_progress(progress_callback, "visuals", "Running frame OCR")
-            ocr_rows, ocr_state = run_ocr_stage(paths, keyframe_rows, ocr_mode=ocr_mode)
+            ocr_rows, ocr_state = run_ocr_stage(paths, selected_keyframe_rows, ocr_mode=ocr_mode)
         except Exception as exc:
             ocr_state = default_ocr_state(ocr_mode)
-            ocr_state["attempted"] = bool(keyframe_rows) and ocr_mode != "off"
+            ocr_state["attempted"] = bool(selected_keyframe_rows) and ocr_mode != "off"
             ocr_state["status"] = "failed"
             ocr_state["error"] = str(exc)
             raise
 
-        if triage_mode == "on" and keyframe_rows:
+        if triage_mode == "on" and selected_keyframe_rows:
             report_progress(progress_callback, "visuals", "Running local triage")
-            frames, segments = triage.run_local_triage(paths.root, keyframe_rows, ocr_rows, transcript)
+            frames, segments = triage.run_local_triage(
+                paths.root,
+                selected_keyframe_rows,
+                ocr_rows,
+                transcript,
+            )
             manifest_entries = [
                 routing.manifest_entry_from_segment(segment, gpt_model)
                 for segment in segments
@@ -2837,7 +3044,11 @@ def analyze_source(
             keyframe_mode=effective_keyframe_mode,
             interval_seconds=interval_seconds,
             scene_threshold=scene_threshold,
-            candidate_frame_count=len(keyframe_rows),
+            candidate_frame_count=keyframe_selection.candidate_count,
+            deduplicated_frame_count=keyframe_selection.deduplicated_count,
+            selected_frame_count=keyframe_selection.selected_count,
+            max_frames=keyframe_selection.max_frames,
+            selection_method=keyframe_selection.method,
             visuals_payload=visuals_payload,
         )
 
@@ -2987,6 +3198,11 @@ def add_analysis_arguments(
         help="Prefer downloaded YouTube video at or below this height (default: yt-dlp selection)",
     )
     parser.add_argument(
+        "--max-frames",
+        type=positive_int,
+        help="Cap keyframes entering OCR and triage after cheap duplicate removal",
+    )
+    parser.add_argument(
         "--triage",
         default=constants.DEFAULT_TRIAGE_MODE,
         choices=["off", "on"],
@@ -3092,6 +3308,7 @@ def analysis_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "audio_features_mode": audio_features_mode,
         "comments_count": comments_count,
         "max_video_height": args.max_video_height,
+        "max_frames": args.max_frames,
         "interval_seconds": interval_seconds,
         "scene_threshold": args.scene_threshold,
         "triage_mode": args.triage,

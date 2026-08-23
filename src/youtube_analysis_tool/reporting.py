@@ -386,6 +386,20 @@ def normalize_visual_sampling(
         "interval_seconds": visual_sampling.get("interval_seconds"),
         "scene_threshold": visual_sampling.get("scene_threshold"),
         "candidate_frame_count": int(visual_sampling.get("candidate_frame_count") or 0),
+        "deduplicated_frame_count": int(
+            visual_sampling.get(
+                "deduplicated_frame_count",
+                visual_sampling.get("candidate_frame_count") or 0,
+            )
+        ),
+        "selected_frame_count": int(
+            visual_sampling.get(
+                "selected_frame_count",
+                visual_sampling.get("candidate_frame_count") or 0,
+            )
+        ),
+        "max_frames": visual_sampling.get("max_frames"),
+        "selection_method": visual_sampling.get("selection_method", "uncapped"),
         "retained_visual_count": int(
             visual_sampling.get("retained_visual_count", retained_slide_count + retained_chart_count)
         ),

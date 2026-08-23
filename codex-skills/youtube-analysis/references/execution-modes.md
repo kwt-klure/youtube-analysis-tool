@@ -38,6 +38,7 @@ cheap; no-subtitle runs may fall back to Whisper and take longer.
   --visuals on \
   --keyframes interval \
   --interval-seconds 60 \
+  --max-frames 36 \
   --ocr off \
   --max-video-height 720 \
   --artifacts debug \
@@ -59,6 +60,7 @@ The reuse input may be a raw transcript artifact or the first pass
   --visuals on \
   --keyframes interval \
   --interval-seconds 60 \
+  --max-frames 36 \
   --ocr off \
   --max-video-height 720 \
   --audio-features off \
@@ -99,7 +101,16 @@ off comments, audio features, or visuals that are not independently useful.
 
 ## Verify Analysis Output
 
-Do not use an analysis bundle as evidence until all checks pass:
+Run the repo-owned checker first:
+
+```bash
+.venv/bin/python scripts/youtube_bundle_check.py \
+  '<fresh-output-dir>/output.json' \
+  --json
+```
+
+Do not use an analysis bundle as evidence until the checker exits zero and all
+checks pass:
 
 1. Capture and require wrapper exit code 0.
 2. Parse `output.json` as JSON.
@@ -113,6 +124,10 @@ Do not use an analysis bundle as evidence until all checks pass:
    - full `provenance`
    - `run_reflection`
    - the evidence layers used for the answer
+
+For capped visual runs, also read `visual_sampling` and, in debug mode,
+`visuals/selection.json` plus selected images under `visuals/candidates/`
+before deciding whether the selected evidence is sufficient.
 
 An `output.json` written by a nonzero or interrupted run is diagnostic partial
 output even when some fields look clean.

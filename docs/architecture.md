@@ -41,7 +41,17 @@ Generate candidates from:
 
 This prevents missing important static slides when scene detection is sparse.
 
-### 4. Local frame triage
+### 4. Optional pre-OCR frame budget
+
+When `--max-frames` is present, use grayscale pHash and sharpness before OCR to
+group near duplicates, retain the sharpest representative, and select an even
+timeline sample under the requested cap. Preserve the first and last timeline
+coverage when the cap allows it.
+
+This stage bounds expensive OCR and triage work. Omitting the cap preserves the
+existing uncapped candidate flow.
+
+### 5. Local frame triage
 
 Each frame should be scored with cheap local features:
 
@@ -61,7 +71,7 @@ Target labels:
 - `b_roll`
 - `uncertain`
 
-### 5. Escalation policy
+### 6. Escalation policy
 
 Default routing:
 
@@ -79,7 +89,7 @@ Before GPT, v1 can stop at a terminal review gate for:
 - low-confidence routed segments
 - segments that need elevated image detail
 
-### 6. GPT usage
+### 7. GPT usage
 
 GPT should answer questions that local tools cannot:
 
