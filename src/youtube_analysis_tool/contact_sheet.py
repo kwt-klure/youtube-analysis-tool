@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,15 @@ class ContactSheetResult:
     sheet_path: Path
     manifest_path: Path
     video_path: Path | None
+
+
+def clear_stale_contact_sheet_artifacts(paths: pipeline.AnalysisPaths) -> None:
+    shutil.rmtree(paths.video_dir, ignore_errors=True)
+    for path in (
+        paths.root / "contact-sheet.jpg",
+        paths.root / "contact-sheet.json",
+    ):
+        path.unlink(missing_ok=True)
 
 
 def auto_contact_sheet_grid(*, frame_count: int, columns: int | None = None) -> ContactSheetGrid:
@@ -141,6 +151,7 @@ def create_contact_sheet(
         output_root_base=output_root_base,
     )
     paths = pipeline.analysis_paths(output_root)
+    clear_stale_contact_sheet_artifacts(paths)
     pipeline.ensure_dirs(paths)
     pipeline.ensure_source_file(paths, source)
 
