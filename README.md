@@ -133,9 +133,10 @@ youtube-analyze \
 
 Available density presets are `default`, `medium`, and `dense`, corresponding
 to 60, 30, and 15 second interval sampling. `--interval-seconds` overrides the
-preset. `--max-frames` is optional; when present, cheap pHash and sharpness
-signals remove duplicate candidates before an evenly distributed subset enters
-OCR and triage. Omitting the flag preserves uncapped behavior.
+preset. `--max-frames` is optional; when present, byte-identical candidates are
+grouped before an elapsed-time-spaced subset enters OCR and triage. See
+[Visuals](#visuals) for the selection and provenance contract. Omitting the flag
+preserves uncapped behavior.
 
 ### Visual-Only
 
@@ -447,6 +448,10 @@ OCR text, transcript excerpts, comments, or local paths.
 - The tool does not provide a polished end-user summary UI.
 
 ## Development
+
+For a versioned macOS Apple Silicon / Python 3.11 recovery baseline, see
+[Environment Recovery](docs/environment-recovery.md). Validate a new environment
+before switching a working checkout to it; normal installation stays unchanged.
 
 Run the unit test suite:
 

@@ -54,6 +54,86 @@ class TriageHelperTests(unittest.TestCase):
         self.assertEqual("slides", label)
         self.assertGreater(confidence, 0.55)
 
+    def test_content_groups_preserve_first_occurrence_and_member_order(self) -> None:
+        records = [
+            {"content_sha256": "b", "timestamp_seconds": 30.0},
+            {"content_sha256": "a", "timestamp_seconds": 20.0},
+            {"content_sha256": "b", "timestamp_seconds": 10.0},
+            {"content_sha256": "c", "timestamp_seconds": 0.0},
+            {"content_sha256": "a", "timestamp_seconds": 40.0},
+        ]
+        original = [dict(record) for record in records]
+
+        groups = triage.group_by_content_hash(records)
+
+        self.assertEqual([[records[0], records[2]], [records[1], records[4]], [records[3]]], groups)
+        self.assertEqual(original, records)
+        for group, indices in zip(groups, ([0, 2], [1, 4], [3])):
+            for member, index in zip(group, indices):
+                self.assertIs(records[index], member)
+        self.assertEqual([], triage.group_by_content_hash([]))
+
+    def test_content_groups_leave_unknown_hashes_distinct(self) -> None:
+        records = [{}, {"content_sha256": None}, {"content_sha256": ""}] * 2
+
+        groups = triage.group_by_content_hash(records)
+
+        self.assertEqual([[record] for record in records], groups)
+        self.assertEqual(6, len({id(group) for group in groups}))
+
+    def test_duplicate_groups_preserve_time_order_without_coarse_hash_merges(self) -> None:
+        frames = [
+            {"frame_id": "later-a", "timestamp_seconds": 6.0, "content_sha256": "a"},
+            {"frame_id": "b", "timestamp_seconds": 1.0, "content_sha256": "b"},
+            {"frame_id": "first-a", "timestamp_seconds": 0.0, "content_sha256": "a"},
+            {"frame_id": "missing-1", "timestamp_seconds": 2.0},
+            {"frame_id": "missing-2", "timestamp_seconds": 3.0},
+            {"frame_id": "none-1", "timestamp_seconds": 4.0, "content_sha256": None},
+            {"frame_id": "none-2", "timestamp_seconds": 5.0, "content_sha256": None},
+            {"frame_id": "empty-1", "timestamp_seconds": 7.0, "content_sha256": ""},
+            {"frame_id": "empty-2", "timestamp_seconds": 8.0, "content_sha256": ""},
+        ]
+        for frame in frames:
+            frame["phash"] = "0000000000000000"
+        original_ids = [frame["frame_id"] for frame in frames]
+
+        triage.assign_duplicate_groups(frames)
+
+        self.assertEqual(original_ids, [frame["frame_id"] for frame in frames])
+        self.assertEqual(
+            ["dup-0001", "dup-0002", "dup-0001", "dup-0003", "dup-0004",
+             "dup-0005", "dup-0006", "dup-0007", "dup-0008"],
+            [frame["duplicate_group"] for frame in frames],
+        )
+        self.assertEqual([False] + [True] * 8, [frame["is_duplicate_representative"] for frame in frames])
+
+    def test_duplicate_representatives_rank_blur_then_ocr_with_stable_ties(self) -> None:
+        cases = [
+            ("blur", [("text", 0.0, 100.0, 100), ("sharp", 1.0, 200.0, 1)], "sharp"),
+            ("ocr", [("early", 0.0, 200.0, 1), ("text", 1.0, 200.0, 100)], "text"),
+            ("time", [("late", 1.0, 200.0, 10), ("early", 0.0, 200.0, 10)], "early"),
+            ("input", [("z-first", 0.0, 200.0, 10), ("a-second", 0.0, 200.0, 10)], "z-first"),
+        ]
+        for name, rows, expected in cases:
+            with self.subTest(name=name):
+                frames = [
+                    {
+                        "frame_id": frame_id,
+                        "timestamp_seconds": timestamp,
+                        "content_sha256": "same-bytes",
+                        "blur_score": blur,
+                        "ocr_char_count": chars,
+                    }
+                    for frame_id, timestamp, blur, chars in rows
+                ]
+
+                triage.assign_duplicate_groups(frames)
+
+                self.assertEqual(
+                    [expected],
+                    [frame["frame_id"] for frame in frames if frame["is_duplicate_representative"]],
+                )
+
     def test_duplicate_groups_keep_sharpest_representative(self) -> None:
         frames = [
             {"frame_id": "frame-1", "timestamp_seconds": 0.0, "content_sha256": "same-bytes", "blur_score": 150.0, "ocr_char_count": 5},

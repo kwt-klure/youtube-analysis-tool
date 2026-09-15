@@ -195,27 +195,30 @@ def relative_frame_path(frame_filename: str) -> str:
     return str(Path("keyframes") / frame_filename)
 
 
-def assign_duplicate_groups(frames: list[dict[str, Any]]) -> None:
-    groups: list[dict[str, Any]] = []
-    for frame in sorted(frames, key=lambda item: float(item["timestamp_seconds"])):
-        selected_group: dict[str, Any] | None = None
-        for group in groups:
-            if frame.get("content_sha256") and frame["content_sha256"] == group["content_sha256"]:
-                selected_group = group
-                break
-        if selected_group is None:
-            selected_group = {
-                "group_id": f"dup-{len(groups) + 1:04d}",
-                "content_sha256": frame.get("content_sha256"),
-                "members": [],
-            }
-            groups.append(selected_group)
-        selected_group["members"].append(frame)
-        frame["duplicate_group"] = selected_group["group_id"]
+def group_by_content_hash(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group known exact hashes in input order, leaving unknown hashes distinct.
 
-    for group in groups:
+    Groups retain first-occurrence order and reference the unmodified records.
+    """
+    groups: list[list[dict[str, Any]]] = []
+    known_groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        content_hash = record.get("content_sha256")
+        group = known_groups.get(content_hash) if content_hash else None
+        if group is None:
+            group = []
+            groups.append(group)
+            if content_hash:
+                known_groups[content_hash] = group
+        group.append(record)
+    return groups
+
+
+def assign_duplicate_groups(frames: list[dict[str, Any]]) -> None:
+    groups = group_by_content_hash(sorted(frames, key=lambda item: float(item["timestamp_seconds"])))
+    for index, group in enumerate(groups, start=1):
         members = sorted(
-            group["members"],
+            group,
             key=lambda item: (
                 float(item.get("blur_score", 0.0)),
                 int(item.get("ocr_char_count", 0)),
@@ -223,7 +226,8 @@ def assign_duplicate_groups(frames: list[dict[str, Any]]) -> None:
             reverse=True,
         )
         representative_frame_id = members[0]["frame_id"] if members else None
-        for member in group["members"]:
+        for member in group:
+            member["duplicate_group"] = f"dup-{index:04d}"
             member["is_duplicate_representative"] = member["frame_id"] == representative_frame_id
 
 

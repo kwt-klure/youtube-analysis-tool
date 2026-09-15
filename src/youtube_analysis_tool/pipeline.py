@@ -2591,7 +2591,6 @@ def select_keyframes_for_processing(
         )
     else:
         candidates: list[dict[str, Any]] = []
-        groups: list[dict[str, Any]] = []
         for row in ordered_rows:
             frame_path = paths.keyframes_dir / str(row["filename"])
             matrix = triage.read_grayscale_image(frame_path)
@@ -2601,34 +2600,24 @@ def select_keyframes_for_processing(
                 "content_sha256": triage.frame_content_hash(frame_path),
                 "blur_score": triage.compute_blur_score(matrix),
             }
-            selected_group: dict[str, Any] | None = None
-            for group in groups:
-                if candidate["content_sha256"] == group["content_sha256"]:
-                    selected_group = group
-                    break
-            if selected_group is None:
-                selected_group = {
-                    "group_id": f"pre-dup-{len(groups) + 1:04d}",
-                    "content_sha256": candidate["content_sha256"],
-                    "members": [],
-                }
-                groups.append(selected_group)
-            selected_group["members"].append(candidate)
-            candidate["duplicate_group"] = selected_group["group_id"]
             candidates.append(candidate)
 
+        groups = triage.group_by_content_hash(candidates)
         representatives: list[dict[str, Any]] = []
         representative_by_group: dict[str, dict[str, Any]] = {}
-        for group in groups:
+        for index, group in enumerate(groups, start=1):
+            group_id = f"pre-dup-{index:04d}"
+            for candidate in group:
+                candidate["duplicate_group"] = group_id
             representative = max(
-                group["members"],
+                group,
                 key=lambda item: (
                     float(item["blur_score"]),
                     -float(item["row"]["timestamp_seconds"]),
                 ),
             )
             representatives.append(representative)
-            representative_by_group[group["group_id"]] = representative
+            representative_by_group[group_id] = representative
         representatives.sort(key=lambda item: float(item["row"]["timestamp_seconds"]))
 
         selected_indices = set(time_spaced_indices(
