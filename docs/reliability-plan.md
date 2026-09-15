@@ -55,8 +55,21 @@ scheduled work is included.
 
 ## Tracking
 
-- [mira-loop:open] [owner:youtube-analysis-tool] Stage 1 inputs and completion - next: add regression cases and repair the boundaries.
-- [mira-loop:open] [owner:youtube-analysis-tool] Stage 2 visual evidence - next: test content equality and time-based selection before changing the filter.
-- [mira-loop:open] [owner:youtube-analysis-tool] Stage 3 evidence-aware acquisition - next: add caption-only and audio/video lane tests.
-- [mira-loop:open] [owner:youtube-analysis-tool] Stage 4 skills and deployment - next: harden and verify sync plus repo selection, then deploy the verified skill.
-- [mira-loop:open] [owner:youtube-analysis-tool] Verification and delivery - next: run integrated tests, inspect privacy, commit and push the feature branch.
+- [mira-loop:closed] [owner:youtube-analysis-tool] Stage 1 inputs and completion - resolution: overlap preserves inputs; reused schema/status/source identity is checked before processing; cleanup failures surface; batch uses the common completion gate. Regression and real-media tests pass.
+- [mira-loop:closed] [owner:youtube-analysis-tool] Stage 2 visual evidence - resolution: byte-identical filtering preserves changed slide text, including downstream triage; time targets cover skewed candidate density and preserve the cap.
+- [mira-loop:closed] [owner:youtube-analysis-tool] Stage 3 evidence-aware acquisition - resolution: caption-only runs skip media; audio and video are acquired only for the requested evidence/fallback stages. Burned-subtitle fallback checks captions first.
+- [mira-loop:closed] [owner:youtube-analysis-tool] Stage 4 skills and deployment - resolution: synchronized processing skill and local intake routing after lock/preimage/symlink/empty-tree regressions and resolver smoke tests; private backup and final hashes verified.
+- [mira-loop:closed] [owner:youtube-analysis-tool] Verification and delivery - resolution: 207 tests passed, including real local-media smoke; public files and private exclusions checked; worker and skill commits pushed to codex/reliability-audit-fixes-20260915 without merging the default branch.
+
+## Verified result
+
+- Plan-before-code commit: `d3f11db`.
+- Worker implementation: `00bb45f`.
+- Skill installation and resolution: `a124396`.
+- Package 1.0.10; output schema 1.0.13.
+- Independent review corrections cover relative-source ambiguity, explicit raw
+  transcript failure, and caption-first burned-subtitle fallback. Focused recheck passed.
+- The 207-test suite includes 19 skill-sync cases, 16 resolver cases and offline
+  ffmpeg/OpenCV visual-only, reuse and keep-intermediates smoke tests.
+- No live YouTube/ASR/API canary was repeated. Network extractor behavior outside
+  mocked acquisition tests and Windows locking remain unverified in this run.

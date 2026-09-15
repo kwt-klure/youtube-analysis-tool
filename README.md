@@ -102,6 +102,10 @@ only then uses optional OpenAI API transcription when `OPENAI_API_KEY` is set.
 The API path uses the installed OpenAI SDK directly and does not depend on a
 global Codex skill.
 
+When captions satisfy the requested stages, no video or audio is downloaded.
+ASR and audio-feature-only runs request audio; visual or burned-subtitle stages
+request video. The frame cap does not bound source download or decoding work.
+
 ### MLX Whisper
 
 Select MLX Whisper explicitly on Apple Silicon:
@@ -164,11 +168,22 @@ youtube-analyze \
   --max-video-height 720 \
   --audio-features off \
   --comments 0 \
-  --artifacts debug
+  --artifacts debug \
+  --out-dir /path/to/fresh-second-pass
 ```
 
 `--reuse-transcript` accepts either a raw transcript artifact or an existing
-analysis bundle containing a top-level `transcript` object.
+completed analysis bundle containing a top-level `transcript` object. Empty,
+failed, skipped, malformed, and known source-mismatched inputs are rejected before
+media acquisition. Raw transcripts without source identity remain supported, with
+`reuse_source_identity: unverified` in provenance. This uncertainty is preserved
+through subsequent reuse. Matching source identity is not verification of wording.
+New bundles record `source.resolved_input`; legacy relative local paths whose
+original working directory is unknown remain unverified, not falsely matched.
+
+Always use a fresh second-pass output directory. Local source media and reusable
+transcripts must be outside that directory; overlapping paths are rejected before
+existing output is cleared, preserving the original input.
 
 ### Rich Intake
 
@@ -231,13 +246,13 @@ sheet manifests record the same information.
 
 ## Output Contract
 
-The current output schema version is `1.0.12`.
+The current output schema version is `1.0.13`.
 
 Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.12",
+  "output_version": "1.0.13",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -284,8 +299,9 @@ youtube-bundle-check /path/to/output.json --json
 The checker exits nonzero for malformed bundles, missing run status, failed or
 aborted runs, and fatal errors.
 
-Batch processing uses this field for new bundles and retains compatibility with
-older bundles that predate it.
+Batch processing uses this same checker. Older bundles without run status are
+rerun rather than accepted as completed. Malformed cached bundles do not stop
+other queued sources.
 
 ### Transcript
 
@@ -315,6 +331,12 @@ retained visual counts. Debug runs also preserve `visuals/selection.json` so a
 frame can be traced as selected, duplicate, or over budget. Capped debug runs
 keep selected candidate images under `visuals/candidates/` even when OCR is off
 and local triage does not promote them as slides or charts.
+
+Destructive duplicate filtering now requires byte-identical frame content, not
+coarse pHash similarity alone. Similar-looking slides with changed text/numbers
+remain separate. Capped selection uses elapsed-time targets across surviving
+representatives; pHash is retained only as a diagnostic signal. This conservative
+policy can retain more near-duplicate frames than previous versions.
 
 ### Run Reflection
 
@@ -371,6 +393,11 @@ youtube-analyze --source /path/to/video.mp4 --artifacts debug
 
 Use `--keep-intermediates` only when downloaded media or normalized audio must
 remain on disk.
+
+`processing.cleanup_requested` records the requested policy; `cleanup_applied`
+is true only when requested cleanup completed without errors. Deletion failures
+produce a failed bundle with a cleanup error rather than a false success. Inspect
+and resolve any reported residual artifacts before treating the run as cleaned.
 
 ## Batch And Library Commands
 
@@ -446,8 +473,19 @@ Install it explicitly with a verified runtime backup:
 youtube-skill-sync --install --json
 ```
 
+Installation serializes cooperating installers, checks the expected runtime
+state immediately before replacement, and verifies the installed hash. Source,
+target and backup paths must not overlap or contain symlinks (including ancestor
+aliases); use physical paths. Backups are protected by owner-only directories.
+The result includes `backup_path` and `preserved_previous_path`; the moved tree
+is intentionally retained in case another process still holds it open. This is
+not a lock against arbitrary external editors. Avoid editing the runtime during
+deployment; archive old preimages only after checking for such writers.
+
 The repository also includes a Codex-compatible processing skill under
 [`codex-skills/youtube-analysis`](codex-skills/youtube-analysis/).
 
 Additional implementation details are documented in
 [`docs/architecture.md`](docs/architecture.md).
+The [reliability repair plan](docs/reliability-plan.md) records this change set's
+scope and acceptance criteria.
