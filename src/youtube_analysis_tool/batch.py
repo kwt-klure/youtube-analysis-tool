@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import constants
 from .artifacts import write_json
+from .bundle_check import check_bundle
 from .pipeline import (
     StderrProgressReporter,
     add_analysis_arguments,
@@ -49,21 +49,7 @@ def candidate_existing_outputs(source: str, *, root: Path) -> list[Path]:
 
 
 def is_completed_output_bundle(path: Path) -> bool:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-
-    processing = payload.get("processing") or {}
-    if "run_status" in processing and processing.get("run_status") != "completed":
-        return False
-
-    errors = payload.get("errors") or []
-    if errors:
-        return False
-
-    transcript = payload.get("transcript") or {}
-    return bool(transcript.get("source"))
+    return bool(check_bundle(path)["valid"])
 
 
 def find_existing_output(source: str, *, root: Path) -> Path | None:
@@ -134,7 +120,11 @@ def main(argv: list[str] | None = None) -> int:
 
     for index, source in enumerate(sources, start=1):
         reporter("batch", f"[{index}/{len(sources)}] Inspecting {source}")
-        existing_output = find_existing_output(source, root=root)
+        try:
+            existing_output = find_existing_output(source, root=root)
+        except (OSError, ValueError, RuntimeError) as exc:
+            reporter("batch", f"[{index}/{len(sources)}] Ignoring unreadable cache: {exc}")
+            existing_output = None
         if existing_output is not None:
             reporter("batch", f"[{index}/{len(sources)}] Skipping existing {source}")
             items.append(

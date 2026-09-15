@@ -80,7 +80,7 @@ class FrameSelectionTests(unittest.TestCase):
             paths = analysis_paths(Path(tmpdir))
             paths.keyframes_dir.mkdir(parents=True)
             for row in rows:
-                (paths.keyframes_dir / str(row["filename"])).write_bytes(b"frame")
+                (paths.keyframes_dir / str(row["filename"])).write_bytes(hashes[str(row["filename"])].encode())
 
             with mock.patch(
                 "youtube_analysis_tool.pipeline.triage.read_grayscale_image",
@@ -123,7 +123,7 @@ class FrameSelectionTests(unittest.TestCase):
                 del video_path, metadata, kwargs
                 rows = [frame_row(f"frame-{index}.jpg", float(index * 10)) for index in range(4)]
                 for row in rows:
-                    (paths.keyframes_dir / str(row["filename"])).write_bytes(b"frame")
+                    (paths.keyframes_dir / str(row["filename"])).write_bytes(str(row["filename"]).encode())
                 return rows
 
             def fake_ocr(paths, rows, *, ocr_mode):

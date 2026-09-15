@@ -20,12 +20,12 @@ def error_is_fatal(error: Any) -> bool:
     return severity not in NON_FATAL_SEVERITIES
 
 
-def check_bundle(path: Path) -> dict[str, Any]:
+def check_bundle_payload(payload: Any, path: Path) -> dict[str, Any]:
     bundle_path = path.expanduser().resolve()
     result: dict[str, Any] = {
         "bundle_path": str(bundle_path),
         "valid": False,
-        "parseable": False,
+        "parseable": True,
         "run_status": None,
         "error_count": 0,
         "fatal_error_count": 0,
@@ -33,16 +33,6 @@ def check_bundle(path: Path) -> dict[str, Any]:
         "visual_status": None,
         "failure_reasons": [],
     }
-    if not bundle_path.is_file():
-        result["failure_reasons"].append("bundle_not_found")
-        return result
-
-    try:
-        payload = json.loads(bundle_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        result["failure_reasons"].append("bundle_not_parseable")
-        return result
-    result["parseable"] = True
     if not isinstance(payload, dict):
         result["failure_reasons"].append("bundle_not_object")
         return result
@@ -75,6 +65,20 @@ def check_bundle(path: Path) -> dict[str, Any]:
 
     result["valid"] = not result["failure_reasons"]
     return result
+
+
+def check_bundle(path: Path) -> dict[str, Any]:
+    bundle_path = path.expanduser().resolve()
+    try:
+        payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        result = check_bundle_payload(None, bundle_path)
+        result["parseable"] = False
+        result["failure_reasons"] = [
+            "bundle_not_found" if isinstance(exc, FileNotFoundError) else "bundle_not_parseable"
+        ]
+        return result
+    return check_bundle_payload(payload, bundle_path)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

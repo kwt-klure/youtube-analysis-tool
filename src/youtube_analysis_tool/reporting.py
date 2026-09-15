@@ -70,6 +70,7 @@ def normalize_source(
 ) -> dict[str, Any]:
     return {
         "input": source_input,
+        "resolved_input": str(Path(source_input).expanduser().resolve()) if not is_url else source_input,
         "kind": "url" if is_url else "local_path",
         "is_youtube_url": is_youtube_url,
     }
@@ -246,6 +247,10 @@ def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[s
     }
     if transcript.get("reused_from"):
         provenance["reused_from"] = transcript["reused_from"]
+    if transcript.get("reuse_source_identity"):
+        provenance["reuse_source_identity"] = transcript["reuse_source_identity"]
+        if transcript["reuse_source_identity"] == "unverified":
+            provenance["quality_notes"].append("reuse_source_identity_unverified")
     if transcript.get("skip_reason"):
         provenance["skip_reason"] = transcript["skip_reason"]
     if transcript.get("backend"):
@@ -513,7 +518,8 @@ def summarize_processing(
         "audio_features_mode": audio_features_mode,
         "gpt_enabled": gpt_mode == "on",
         "artifact_mode": artifacts_mode,
-        "cleanup_applied": cleanup_intermediates,
+        "cleanup_requested": cleanup_intermediates,
+        "cleanup_applied": cleanup_intermediates and not any(error.get("stage") == "cleanup" for error in errors),
         "ocr_status": ocr.get("status"),
         "burned_subtitles_status": burned_subtitles.get("status"),
         "burned_subtitles_reason": burned_subtitles.get("reason"),

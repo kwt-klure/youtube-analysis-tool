@@ -574,6 +574,8 @@ class LocalAsrBackendTests(unittest.TestCase):
             source_path.write_text(
                 json.dumps(
                     {
+                        "processing": {"run_status": "completed"},
+                        "errors": [],
                         "transcript": {
                             "source": "whisper",
                             "full_text": "MLX transcript",

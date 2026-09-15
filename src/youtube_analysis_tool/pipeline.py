@@ -22,6 +22,7 @@ from xml.etree import ElementTree
 
 from . import constants, gpt, reporting, review, routing, triage, visuals
 from .artifacts import write_json
+from .bundle_check import check_bundle_payload
 from .version import add_version_argument
 
 
@@ -301,7 +302,7 @@ def ensure_dirs(paths: AnalysisPaths, with_ocr: bool = False) -> None:
 
 
 def clear_stale_output_files(paths: AnalysisPaths) -> None:
-    for directory in (
+    remove_artifact_directories((
         paths.audio_dir,
         paths.video_dir,
         paths.subtitles_dir,
@@ -314,8 +315,7 @@ def clear_stale_output_files(paths: AnalysisPaths) -> None:
         paths.report_dir,
         paths.visuals_dir,
         paths.root / "tmp-whisper",
-    ):
-        shutil.rmtree(directory, ignore_errors=True)
+    ))
     for path in (
         paths.output_json_path,
         paths.root / "analysis.json",
@@ -888,7 +888,10 @@ def download_subtitle_from_metadata(
 
 def parse_timestamp(raw: str) -> float:
     token = raw.replace(",", ".")
-    hours, minutes, seconds = token.split(":")
+    parts = token.split(":")
+    if len(parts) == 2:
+        parts.insert(0, "0")
+    hours, minutes, seconds = parts
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
@@ -1041,16 +1044,72 @@ def skipped_transcript(reason: str = "transcript_mode_off") -> dict[str, Any]:
     }
 
 
-def normalize_reused_transcript_payload(payload: dict[str, Any], source_path: Path) -> dict[str, Any]:
-    transcript_payload = payload.get("transcript") if isinstance(payload.get("transcript"), dict) else payload
-    segments = transcript_payload.get("segments") or []
+def normalize_reused_transcript_payload(
+    payload: dict[str, Any], source_path: Path, *, source_input: str | None = None,
+) -> dict[str, Any]:
+    is_bundle = "transcript" in payload or "processing" in payload
+    if is_bundle and not check_bundle_payload(payload, source_path)["valid"]:
+        raise ValueError("Reusable transcript bundle must be completed without fatal errors.")
+    transcript_payload = payload.get("transcript") if is_bundle else payload
+    if not isinstance(transcript_payload, dict):
+        raise ValueError("Reusable transcript must contain a transcript object.")
+    if "source" in transcript_payload and (
+        not isinstance(transcript_payload["source"], str) or not transcript_payload["source"].strip()
+    ):
+        raise ValueError("Reusable transcript source must be a nonempty string when provided.")
+    segments = transcript_payload.get("segments", [])
+    if not isinstance(segments, list):
+        raise ValueError("Reusable transcript segments must be an array.")
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            raise ValueError("Reusable transcript segments must contain text and finite timestamps.")
+        times = [segment.get("start"), segment.get("end")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) or value < 0 for value in times) or times[1] < times[0]:
+            raise ValueError("Reusable transcript timestamps must be finite, nonnegative and ordered.")
     text = transcript_payload.get("text")
     if text is None:
-        text = transcript_payload.get("full_text", "")
+        text = transcript_payload.get("full_text", " ".join(item["text"] for item in segments))
+    if not isinstance(text, str) or not (text.strip() or any(item["text"].strip() for item in segments)):
+        raise ValueError("Reusable transcript must contain nonempty text.")
+    unusable_states = ("skipped", "failed", "aborted", "interrupted")
+    prior_provenance = transcript_payload.get("provenance")
+    if transcript_payload.get("source") == "skipped" or transcript_payload.get("status") in unusable_states or (
+        isinstance(prior_provenance, dict) and prior_provenance.get("status") in unusable_states
+    ):
+        raise ValueError("A skipped, failed or interrupted transcript cannot be reused as evidence.")
+    identity_status = "unverified"
+    original_source = payload.get("source") if is_bundle else None
+    original_input = original_source.get("input") if isinstance(original_source, dict) else None
+    if original_input is not None and not isinstance(original_input, str):
+        raise ValueError("Reusable bundle source input must be a string.")
+    if original_input and not looks_like_url(original_input):
+        resolved_input = original_source.get("resolved_input")
+        if resolved_input is not None:
+            if not isinstance(resolved_input, str) or not Path(resolved_input).is_absolute():
+                raise ValueError("Reusable bundle resolved source must be an absolute path.")
+            original_input = resolved_input
+        elif not Path(original_input).is_absolute():
+            # The cwd of an older bundle cannot be reconstructed from its path.
+            original_input = None
+    if original_input and source_input:
+        def identity(value: str) -> tuple[str, str]:
+            video_id = youtube_video_id_from_source(value)
+            if video_id:
+                return "youtube", video_id
+            return ("url", value) if looks_like_url(value) else ("file", str(Path(value).expanduser().resolve()))
+        if identity(original_input) != identity(source_input):
+            raise ValueError("Reusable transcript source does not match the requested source.")
+        identity_status = "matched"
+    if transcript_payload.get("reuse_source_identity") == "unverified" or (
+        isinstance(prior_provenance, dict) and prior_provenance.get("reuse_source_identity") == "unverified"
+    ):
+        identity_status = "unverified"
     transcript = dict(transcript_payload)
+    transcript.setdefault("source", "external")
     transcript["text"] = text or ""
     transcript["segments"] = segments
-    transcript["segment_count"] = transcript_payload.get("segment_count", len(segments))
+    transcript["segment_count"] = len(segments)
     provenance = transcript_payload.get("provenance")
     if isinstance(provenance, dict):
         for key in ("backend", "model"):
@@ -1058,15 +1117,20 @@ def normalize_reused_transcript_payload(payload: dict[str, Any], source_path: Pa
                 transcript[key] = provenance[key]
     transcript["status"] = "reused"
     transcript["reused_from"] = str(source_path)
+    transcript["reuse_source_identity"] = identity_status
     return transcript
 
 
-def load_reused_transcript(path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+def read_reused_transcript(path: Path, *, source_input: str | None = None) -> dict[str, Any]:
     source_path = path.expanduser().resolve()
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Reusable transcript must be a JSON object: {source_path}")
-    transcript = normalize_reused_transcript_payload(payload, source_path)
+    return normalize_reused_transcript_payload(payload, source_path, source_input=source_input)
+
+
+def load_reused_transcript(path: Path, paths: AnalysisPaths) -> dict[str, Any]:
+    transcript = read_reused_transcript(path)
     write_transcript(paths, transcript)
     return transcript
 
@@ -2266,8 +2330,15 @@ def download_youtube_media(
     metadata_hint: dict[str, Any] | None = None,
     fetch_subtitles: bool = True,
     max_video_height: int | None = None,
+    media_kind: str = "video",
+    transcript_fallback_kind: str = "audio",
+    captions_media_kind: str = "none",
     progress_callback: Callable[[str, str], None] | None = None,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], Path | None]:
+    if media_kind not in {"video", "audio", "transcript", "none"}:
+        raise ValueError(f"Unsupported media kind: {media_kind}")
+    if transcript_fallback_kind not in {"video", "audio"} or captions_media_kind not in {"none", "audio"}:
+        raise ValueError("Invalid transcript media requirements.")
     if fetch_subtitles:
         report_progress(progress_callback, "transcript", "Fetching subtitle tracks")
         try:
@@ -2298,6 +2369,14 @@ def download_youtube_media(
                 )
             except Exception:
                 pass
+    if media_kind == "transcript":
+        media_kind = captions_media_kind if transcript_from_preferred_subtitles(paths) is not None else transcript_fallback_kind
+    if media_kind == "none":
+        info = metadata_hint if metadata_hint is not None else fetch_youtube_metadata(url)
+        write_json(paths.metadata_path, info)
+        return info, None
+    media_dir = paths.audio_dir if media_kind == "audio" else paths.video_dir
+    media_stem = "downloaded" if media_kind == "audio" else "source"
     video_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -2306,10 +2385,12 @@ def download_youtube_media(
         "merge_output_format": "mp4",
         "progress_hooks": [make_download_progress_hook(progress_callback)],
         "outtmpl": {
-            "default": str(paths.video_dir / "source.%(ext)s"),
+            "default": str(media_dir / f"{media_stem}.%(ext)s"),
         },
     }
-    format_selector = youtube_format_selector(max_video_height)
+    format_selector = "bestaudio/best" if media_kind == "audio" else youtube_format_selector(max_video_height)
+    if media_kind == "audio":
+        video_opts.pop("merge_output_format", None)
     if format_selector is not None:
         video_opts["format"] = format_selector
     report_progress(progress_callback, "download", "Starting source media download")
@@ -2335,11 +2416,11 @@ def download_youtube_media(
     write_json(paths.metadata_path, info)
     candidates = [
         path
-        for path in paths.video_dir.glob("source.*")
+        for path in media_dir.glob(f"{media_stem}.*")
         if path.is_file() and not path.name.endswith(".part")
     ]
     if not candidates:
-        raise FileNotFoundError("yt-dlp did not leave a downloaded video file in the video directory.")
+        raise FileNotFoundError(f"yt-dlp did not leave a downloaded {media_kind} file.")
     return info, sorted(candidates)[0]
 
 
@@ -2351,7 +2432,8 @@ def transcript_from_preferred_subtitles(paths: AnalysisPaths) -> dict[str, Any] 
     subtitle_file = choose_subtitle_file(paths.subtitles_dir)
     if subtitle_file is None:
         return None
-    return transcript_from_subtitles(subtitle_file, paths)
+    transcript = transcript_from_subtitles(subtitle_file, paths)
+    return transcript if transcript["text"].strip() else None
 
 
 def transcript_strategy_auto(
@@ -2463,6 +2545,23 @@ def evenly_spaced_indices(total: int, limit: int) -> list[int]:
     return [round(index * (total - 1) / (limit - 1)) for index in range(limit)]
 
 
+def time_spaced_indices(timestamps: list[float], limit: int) -> list[int]:
+    if not timestamps or limit <= 0:
+        return []
+    if limit >= len(timestamps):
+        return list(range(len(timestamps)))
+    if limit == 1:
+        return [0]
+    selected: list[int] = []
+    for slot in range(limit):
+        target = timestamps[0] + (timestamps[-1] - timestamps[0]) * slot / (limit - 1)
+        start = selected[-1] + 1 if selected else 0
+        # Reserve enough later candidates so every slot stays distinct.
+        stop = len(timestamps) - (limit - slot - 1)
+        selected.append(min(range(start, stop), key=lambda index: (abs(timestamps[index] - target), index)))
+    return selected
+
+
 def select_keyframes_for_processing(
     keyframe_rows: list[dict[str, Any]],
     paths: AnalysisPaths,
@@ -2499,20 +2598,18 @@ def select_keyframes_for_processing(
             candidate = {
                 "row": row,
                 "phash": triage.compute_phash(matrix, frame_path),
+                "content_sha256": triage.frame_content_hash(frame_path),
                 "blur_score": triage.compute_blur_score(matrix),
             }
             selected_group: dict[str, Any] | None = None
             for group in groups:
-                if (
-                    triage.hamming_distance(candidate["phash"], group["reference_phash"])
-                    <= constants.DEFAULT_PHASH_DUPLICATE_DISTANCE
-                ):
+                if candidate["content_sha256"] == group["content_sha256"]:
                     selected_group = group
                     break
             if selected_group is None:
                 selected_group = {
                     "group_id": f"pre-dup-{len(groups) + 1:04d}",
-                    "reference_phash": candidate["phash"],
+                    "content_sha256": candidate["content_sha256"],
                     "members": [],
                 }
                 groups.append(selected_group)
@@ -2534,7 +2631,9 @@ def select_keyframes_for_processing(
             representative_by_group[group["group_id"]] = representative
         representatives.sort(key=lambda item: float(item["row"]["timestamp_seconds"]))
 
-        selected_indices = set(evenly_spaced_indices(len(representatives), max_frames))
+        selected_indices = set(time_spaced_indices(
+            [float(item["row"]["timestamp_seconds"]) for item in representatives], max_frames
+        ))
         selected_representatives = [
             representative
             for index, representative in enumerate(representatives)
@@ -2561,6 +2660,7 @@ def select_keyframes_for_processing(
                 {
                     **row,
                     "phash": candidate["phash"],
+                    "content_sha256": candidate["content_sha256"],
                     "blur_score": candidate["blur_score"],
                     "duplicate_group": group_id,
                     "representative_filename": representative_filename,
@@ -2574,7 +2674,7 @@ def select_keyframes_for_processing(
             deduplicated_count=len(representatives),
             selected_count=len(selected_representatives),
             max_frames=max_frames,
-            method="phash_sharpest_then_even_timeline",
+            method="exact_content_then_time_targets",
             entries=entries,
         )
 
@@ -2679,27 +2779,41 @@ def write_empty_stage_artifacts(paths: AnalysisPaths) -> None:
 
 
 def cleanup_intermediate_artifacts(paths: AnalysisPaths) -> None:
-    for directory in (
+    remove_artifact_directories((
         paths.audio_dir,
         paths.video_dir,
         paths.subtitles_dir,
         paths.keyframes_dir,
         paths.ocr_dir,
         paths.root / "tmp-whisper",
-    ):
-        shutil.rmtree(directory, ignore_errors=True)
+    ))
+
+
+def remove_artifact_directories(directories: tuple[Path, ...]) -> None:
+    failures = []
+    for directory in directories:
+        try:
+            if directory.is_symlink():
+                directory.unlink()
+            elif directory.exists():
+                shutil.rmtree(directory)
+            if directory.exists() or directory.is_symlink():
+                raise OSError("directory still exists after deletion")
+        except OSError as exc:
+            failures.append(f"{directory.name}: {exc}")
+    if failures:
+        raise RuntimeError("Artifact cleanup failed: " + "; ".join(failures))
 
 
 def cleanup_non_debug_artifacts(paths: AnalysisPaths) -> None:
-    for directory in (
+    remove_artifact_directories((
         paths.triage_dir,
         paths.review_dir,
         paths.routing_dir,
         paths.gpt_dir,
         paths.report_dir,
         paths.visuals_dir,
-    ):
-        shutil.rmtree(directory, ignore_errors=True)
+    ))
     for path in (
         paths.metadata_path,
         paths.source_path,
@@ -2757,6 +2871,8 @@ def analyze_source(
 ) -> Path:
     load_local_env()
     source_path = Path(source).expanduser()
+    reuse_transcript_path = Path(reuse_transcript).expanduser() if reuse_transcript is not None else None
+    reused_payload = read_reused_transcript(reuse_transcript_path, source_input=source) if reuse_transcript_path else None
     metadata_hint: dict[str, Any] | None = None
     if looks_like_url(source):
         report_progress(progress_callback, "metadata", "Fetching YouTube metadata")
@@ -2768,6 +2884,9 @@ def analyze_source(
         output_root=output_root_base,
     )
     paths = analysis_paths(output_root)
+    for input_path in (reuse_transcript_path, source_path if not looks_like_url(source) else None):
+        if input_path is not None and input_path.resolve().is_relative_to(paths.root.resolve()):
+            raise ValueError("Input/output overlap: use a fresh output directory outside the input location.")
     clear_stale_output_files(paths)
     ensure_dirs(paths)
     ensure_source_file(paths, source)
@@ -2799,19 +2918,28 @@ def analyze_source(
     errors: list[dict[str, Any]] = []
     run_status = "failed"
     pipeline_succeeded = False
-    reuse_transcript_path = Path(reuse_transcript).expanduser() if reuse_transcript is not None else None
     should_fetch_subtitles = transcript_mode != "off" and reuse_transcript_path is None
 
     try:
         if looks_like_url(source):
             metadata = metadata_hint or fetch_youtube_metadata(source, progress_callback=progress_callback)
             write_json(paths.metadata_path, metadata)
+            needs_video = visuals_mode == "on" and keyframe_mode != "off"
+            if needs_video:
+                media_kind = "video"
+            elif should_fetch_subtitles and transcript_mode != "subtitles":
+                media_kind = "transcript"
+            else:
+                media_kind = "audio" if audio_features_mode != "off" else "none"
             metadata, video_path = download_youtube_media(
                 source,
                 paths,
                 metadata_hint=metadata,
                 fetch_subtitles=should_fetch_subtitles,
                 max_video_height=max_video_height,
+                media_kind=media_kind,
+                transcript_fallback_kind="video" if burned_subtitles_mode != "off" else "audio",
+                captions_media_kind="audio" if audio_features_mode != "off" else "none",
                 progress_callback=progress_callback,
             )
             audio_input = video_path
@@ -2824,7 +2952,8 @@ def analyze_source(
 
         if reuse_transcript_path is not None:
             report_progress(progress_callback, "transcript", "Reusing existing transcript artifact")
-            transcript = load_reused_transcript(reuse_transcript_path, paths)
+            transcript = reused_payload
+            write_transcript(paths, transcript)
         elif transcript_mode == "off":
             report_progress(progress_callback, "transcript", "Skipping transcript extraction")
             transcript = skipped_transcript()

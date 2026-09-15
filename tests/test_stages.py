@@ -56,8 +56,8 @@ class TriageHelperTests(unittest.TestCase):
 
     def test_duplicate_groups_keep_sharpest_representative(self) -> None:
         frames = [
-            {"frame_id": "frame-1", "timestamp_seconds": 0.0, "phash": "0f0f0f0f0f0f0f0f", "blur_score": 150.0, "ocr_char_count": 5},
-            {"frame_id": "frame-2", "timestamp_seconds": 1.0, "phash": "0f0f0f0f0f0f0f0e", "blur_score": 300.0, "ocr_char_count": 5},
+            {"frame_id": "frame-1", "timestamp_seconds": 0.0, "content_sha256": "same-bytes", "blur_score": 150.0, "ocr_char_count": 5},
+            {"frame_id": "frame-2", "timestamp_seconds": 1.0, "content_sha256": "same-bytes", "blur_score": 300.0, "ocr_char_count": 5},
         ]
 
         triage.assign_duplicate_groups(frames)

@@ -60,6 +60,7 @@ class BatchQueueTests(unittest.TestCase):
                 existing / "output.json",
                 {
                     "transcript": {"source": "subtitle_manual"},
+                    "processing": {"run_status": "completed"},
                     "errors": [],
                 },
             )

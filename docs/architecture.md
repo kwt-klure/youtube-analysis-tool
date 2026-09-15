@@ -20,7 +20,9 @@ Use a local-first funnel:
 
 - input: YouTube URL or local media file
 - local tools: `yt-dlp`, `ffprobe`
-- outputs: media metadata, local video/audio, subtitle files when available
+- outputs: metadata and subtitles, plus only the media required by enabled stages
+- reuse input validation and input/output overlap checks precede output clearing
+- caption-only runs need no media; ASR/audio features use audio; visual work uses video
 
 ### 2. Transcript
 
@@ -43,13 +45,14 @@ This prevents missing important static slides when scene detection is sparse.
 
 ### 4. Optional pre-OCR frame budget
 
-When `--max-frames` is present, use grayscale pHash and sharpness before OCR to
-group near duplicates, retain the sharpest representative, and select an even
-timeline sample under the requested cap. Preserve the first and last timeline
-coverage when the cap allows it.
+When `--max-frames` is present, group only byte-identical frame content before
+OCR, retain a deterministic representative, and select distinct candidates
+nearest evenly spaced elapsed-time targets. Preserve first and last surviving
+representatives when the cap allows it. Coarse pHash remains a diagnostic, not
+authority to discard frames. Local triage uses the same exact-content rule.
 
-This stage bounds expensive OCR and triage work. Omitting the cap preserves the
-existing uncapped candidate flow.
+This stage bounds OCR and triage input counts, not source download, full candidate
+extraction or decoding. Omitting the cap preserves the uncapped candidate flow.
 
 ### 5. Local frame triage
 

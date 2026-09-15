@@ -80,6 +80,11 @@ def hamming_distance(hash_a: str, hash_b: str) -> int:
     return (int(hash_a, 16) ^ int(hash_b, 16)).bit_count()
 
 
+def frame_content_hash(image_path: Path) -> str:
+    # Only byte-identical frames may be discarded without inspecting their text.
+    return hashlib.sha256(image_path.read_bytes()).hexdigest()
+
+
 def compute_motion_proxy(matrix: Matrix | None, previous_matrix: Matrix | None) -> float:
     if matrix is None or previous_matrix is None:
         return 0.0
@@ -195,13 +200,13 @@ def assign_duplicate_groups(frames: list[dict[str, Any]]) -> None:
     for frame in sorted(frames, key=lambda item: float(item["timestamp_seconds"])):
         selected_group: dict[str, Any] | None = None
         for group in groups:
-            if hamming_distance(frame["phash"], group["reference_phash"]) <= constants.DEFAULT_PHASH_DUPLICATE_DISTANCE:
+            if frame.get("content_sha256") and frame["content_sha256"] == group["content_sha256"]:
                 selected_group = group
                 break
         if selected_group is None:
             selected_group = {
                 "group_id": f"dup-{len(groups) + 1:04d}",
-                "reference_phash": frame["phash"],
+                "content_sha256": frame.get("content_sha256"),
                 "members": [],
             }
             groups.append(selected_group)
@@ -379,6 +384,7 @@ def build_frame_records(
             "ocr_char_count": ocr_char_count(ocr_text),
             "blur_score": compute_blur_score(matrix),
             "phash": compute_phash(matrix, frame_path),
+            "content_sha256": frame_content_hash(frame_path),
             "motion_proxy": compute_motion_proxy(matrix, previous_matrix),
             "numeric_token_ratio": numeric_token_ratio(ocr_text),
             "chart_hint_score": chart_hint_score(ocr_text),
