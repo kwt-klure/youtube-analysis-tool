@@ -13,7 +13,8 @@ workflow.
 
 1. Determine the source type and requested evidence.
 2. Read [references/execution-modes.md](references/execution-modes.md) before
-   running a concrete lane.
+   running a concrete lane. Resolve and validate the repo once using its helper;
+   run every lane and checker from that returned repo.
 3. Select the narrowest lane that can answer the request.
 4. Run local extraction before considering GPT.
 5. Verify process exit and run the repo-owned bundle checker before using an
@@ -48,7 +49,8 @@ Treat `output.json` as completed evidence only when all are true:
 Treat `failed` and `aborted` bundles as diagnostic partial output. Never infer
 success merely because `output.json` exists.
 
-Use the machine-readable gate after each analysis run:
+Use the machine-readable gate after each analysis run, from the same resolved
+repo:
 
 ```bash
 .venv/bin/python scripts/youtube_bundle_check.py \
