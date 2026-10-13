@@ -164,6 +164,14 @@ checks pass:
    - `run_reflection`
    - the evidence layers used for the answer
 
+If `run_reflection` reports `sparse_transcript`, use its duration, character
+count and segment count to assess whether the text supports the intended
+claim. A completed run can still contain too little text to describe the whole
+video. This is not proof of ASR failure: music, silence or visual-led material
+may explain it. Narrow the answer or choose a bounded evidence check only when
+needed; do not automatically rerun ASR, enable visuals or call a provider.
+Absence of this advisory is not a completeness guarantee.
+
 For capped visual runs, also read `visual_sampling` and, in debug mode,
 `visuals/selection.json` plus selected images under `visuals/candidates/`
 before deciding whether the selected evidence is sufficient.

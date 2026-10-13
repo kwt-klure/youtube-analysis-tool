@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from youtube_analysis_tool import constants, gpt, pipeline, reporting, review, routing, triage, visuals
+from youtube_analysis_tool import bundle_check, constants, gpt, pipeline, reporting, review, routing, triage, visuals
 
 
 class TriageHelperTests(unittest.TestCase):
@@ -347,6 +347,44 @@ class GptAndReportTests(unittest.TestCase):
 
 
 class OutputBundleTests(unittest.TestCase):
+    def test_sparse_transcript_bundle_stays_completed_and_valid(self) -> None:
+        for text_fields in ({"text": "Small amount of text."},
+                            {"full_text": "Small amount of text."},
+                            {"text": " ", "full_text": "Small amount of text."}, {}):
+            with self.subTest(text_fields=text_fields), tempfile.TemporaryDirectory() as tmpdir:
+                paths = pipeline.analysis_paths(Path(tmpdir))
+                transcript = {
+                    "source": "whisper", "backend": "openai-whisper", "model": "base",
+                    "reused_from": "transcript.json",
+                    "segments": [{"start": 0.0, "end": 189.0, "text": "Small amount of text."}],
+                    **text_fields,
+                }
+                reporting.write_output_file(
+                    paths,
+                    source_input="/tmp/sparse-demo.mp4", is_url=False, is_youtube_url=False,
+                    metadata={"id": "sparse-demo", "format": {"duration": "189.0"}},
+                    transcript=transcript, ocr={}, burned_subtitles={},
+                    visuals_payload={"slides": [], "charts": []}, errors=[],
+                    cleanup_intermediates=True, transcript_mode="auto", visuals_mode="off",
+                    ocr_mode="off", gpt_mode="off", artifacts_mode="minimal",
+                )
+                written = json.loads(paths.output_json_path.read_text(encoding="utf-8"))
+                checked = bundle_check.check_bundle(paths.output_json_path)
+
+            signal, = [item for item in written["run_reflection"]["uncertainties"]
+                       if item["type"] == "sparse_transcript"]
+            self.assertEqual(189.0, signal["media_duration_seconds"])
+            self.assertEqual(17, signal["text_character_count"])
+            self.assertEqual(1, signal["nonempty_segment_count"])
+            self.assertIn("sparse_transcript", written["run_reflection"]["summary"]["limitations"])
+            self.assertEqual("completed", written["processing"]["run_status"])
+            self.assertEqual([], written["errors"])
+            self.assertTrue(checked["valid"])
+            self.assertEqual("reused", written["transcript"]["provenance"]["status"])
+            self.assertEqual("openai-whisper", written["transcript"]["provenance"]["backend"])
+            self.assertEqual(reporting.transcript_interpretation(transcript),
+                             written["transcript"].get("interpretation"))
+
     def test_output_json_embeds_full_transcript_and_visual_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

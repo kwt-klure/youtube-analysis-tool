@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import unicodedata
 from typing import Any
 
 from . import constants
@@ -66,8 +68,15 @@ def _transcript_segments(transcript: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         segment
         for segment in transcript.get("segments") or []
-        if str(segment.get("text", "")).strip()
+        if str(segment.get("text") or "").strip()
     ]
+
+
+def _transcript_text(transcript: dict[str, Any]) -> str:
+    for value in (transcript.get("full_text"), transcript.get("text")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return " ".join(str(segment["text"]) for segment in _transcript_segments(transcript))
 
 
 def _all_visual_items(visuals: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -118,9 +127,7 @@ def _evidence_layers(
     comments: dict[str, Any],
 ) -> list[str]:
     layers: list[str] = []
-    if transcript.get("source") not in {None, "skipped"} and (
-        transcript.get("full_text") or transcript.get("segments")
-    ):
+    if transcript.get("source") not in {None, "skipped"} and _transcript_text(transcript):
         layers.append("transcript")
     if visual_sampling.get("status") == "extracted" and int(visual_sampling.get("candidate_frame_count") or 0) > 0:
         layers.append("visual_sampling")
@@ -141,9 +148,7 @@ def _limitations(
     comments: dict[str, Any],
 ) -> list[str]:
     limitations: list[str] = []
-    if transcript.get("source") in {None, "skipped"} or not (
-        transcript.get("full_text") or transcript.get("segments")
-    ):
+    if transcript.get("source") in {None, "skipped"} or not _transcript_text(transcript):
         limitations.append("transcript_unavailable")
     visual_status = visual_sampling.get("status", "skipped")
     if visual_status in {"disabled", "skipped"}:
@@ -165,6 +170,45 @@ def _limitations(
     elif comment_status == "extracted" and not (comments.get("items") or []):
         limitations.append("no_comments_returned")
     return limitations
+
+
+def _reflect_sparse_transcript(
+    *,
+    transcript: dict[str, Any],
+    media_duration_seconds: Any,
+    uncertainties: list[dict[str, Any]],
+    adjustments: list[dict[str, Any]],
+) -> None:
+    if transcript.get("source") in {None, "skipped"}:
+        return
+    text = _transcript_text(transcript)
+    if not text:
+        return
+    try:
+        duration = float(media_duration_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not math.isfinite(duration) or duration < constants.DEFAULT_REFLECTION_SPARSE_MIN_DURATION_SECONDS:
+        return
+    # Count characters across writing systems without treating words or timing as speech coverage.
+    character_count = sum(character.isalnum() for character in unicodedata.normalize("NFC", text))
+    if character_count >= constants.DEFAULT_REFLECTION_SPARSE_MIN_TEXT_CHARACTERS:
+        return
+    uncertainties.append({
+        "type": "sparse_transcript",
+        "evidence_layers": ["transcript"],
+        "media_duration_seconds": duration,
+        "text_character_count": character_count,
+        "nonempty_segment_count": len(_transcript_segments(transcript)),
+        "why_it_matters": "little transcript text is available for this media duration; it may not support a whole-video account",
+        "caution": "provisional text-volume heuristic, not speech coverage or an ASR failure; music, silence or visual-led content may explain it",
+    })
+    adjustments.append({
+        "action": "assess_transcript_sufficiency",
+        "target": "transcript",
+        "reason": "sparse transcript: check whether the available text supports the intended claim before requesting more evidence",
+        "caution": "advisory only; do not automatically retry ASR, enable visuals or call a provider",
+    })
 
 
 def _reflect_visual_references(
@@ -354,6 +398,7 @@ def build_run_reflection(
     visual_sampling: dict[str, Any] | None,
     audio_features: dict[str, Any] | None,
     comments: dict[str, Any] | None,
+    media_duration_seconds: Any = None,
 ) -> dict[str, Any]:
     transcript = transcript or {}
     visuals = visuals or {"slides": [], "charts": []}
@@ -366,6 +411,12 @@ def build_run_reflection(
     adjustments: list[dict[str, Any]] = []
     skill_candidates: list[dict[str, Any]] = []
 
+    _reflect_sparse_transcript(
+        transcript=transcript,
+        media_duration_seconds=media_duration_seconds,
+        uncertainties=uncertainties,
+        adjustments=adjustments,
+    )
     _reflect_visual_references(
         transcript=transcript,
         visual_items=visual_items,
@@ -401,6 +452,8 @@ def build_run_reflection(
         audio_features=audio_features,
         comments=comments,
     )
+    if any(item["type"] == "sparse_transcript" for item in uncertainties):
+        limitations.append("sparse_transcript")
     if not layers:
         status = "skipped"
     elif limitations or uncertainties:

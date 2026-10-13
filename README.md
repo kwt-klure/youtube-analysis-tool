@@ -247,13 +247,13 @@ sheet manifests record the same information.
 
 ## Output Contract
 
-The current output schema version is `1.0.13`.
+The current output schema version is `1.0.14`.
 
 Top-level shape:
 
 ```json
 {
-  "output_version": "1.0.13",
+  "output_version": "1.0.14",
   "source": {},
   "metadata": {},
   "transcript": {},
@@ -344,6 +344,21 @@ policy can retain more near-duplicate frames than previous versions.
 `run_reflection` is deterministic, local evidence routing. It reports available
 layers, limitations, uncertainties, and possible next-run adjustments. It does
 not call GPT and does not modify the tool or its skills automatically.
+
+`sparse_transcript` flags a small amount of transcript evidence: a known finite
+media duration of at least 120 seconds with fewer than 80 Unicode letters or
+numbers in the available text. The uncertainty includes media duration, text
+character count and nonempty segment count. Text is Unicode-normalized (NFC);
+spaces and punctuation are excluded. Full text is used first, with segment
+text as a fallback. Skipped or empty transcripts keep the existing unavailable
+signal; short clips and missing/invalid duration do not trigger this rule.
+
+This is a provisional text-volume heuristic, not a speech-coverage estimate,
+accuracy score or ASR failure. Music, silence or visual-led material may
+legitimately contain little speech; absence of the signal does not establish
+completeness. Check whether the text supports the intended claim before
+requesting more evidence. The advisory does not change `processing.run_status`,
+add errors, or automatically retry ASR, enable visuals or call a provider.
 
 ### Audio And Comments
 

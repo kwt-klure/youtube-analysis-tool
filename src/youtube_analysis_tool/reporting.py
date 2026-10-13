@@ -262,10 +262,15 @@ def normalize_transcript_provenance(transcript: dict[str, Any] | None) -> dict[s
 
 def normalize_transcript(transcript: dict[str, Any] | None) -> dict[str, Any]:
     transcript = transcript or {}
+    full_text = next(
+        (value for value in (transcript.get("text"), transcript.get("full_text"))
+         if isinstance(value, str) and value.strip()),
+        "",
+    )
     normalized = {
         "source": transcript.get("source"),
         "language": transcript.get("language"),
-        "full_text": transcript.get("text", ""),
+        "full_text": full_text,
         "segments": normalize_transcript_segments(transcript.get("segments")),
         "segment_count": transcript.get("segment_count", len(transcript.get("segments") or [])),
         "provenance": normalize_transcript_provenance(transcript),
@@ -568,6 +573,8 @@ def build_output_payload(
     gpt_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_visuals = normalize_visuals_payload(visuals_payload)
+    normalized_metadata = normalize_metadata(metadata)
+    normalized_transcript = normalize_transcript(transcript)
     normalized_audio_features = normalize_audio_features(audio_features)
     normalized_comments = normalize_comments(comments)
     normalized_visual_sampling = normalize_visual_sampling(
@@ -576,11 +583,12 @@ def build_output_payload(
         visuals_mode=visuals_mode,
     )
     run_reflection = reflection.build_run_reflection(
-        transcript=normalize_transcript(transcript),
+        transcript=normalized_transcript,
         visuals=normalized_visuals,
         visual_sampling=normalized_visual_sampling,
         audio_features=normalized_audio_features,
         comments=normalized_comments,
+        media_duration_seconds=normalized_metadata.get("duration"),
     )
     payload = {
         "output_version": constants.OUTPUT_VERSION,
@@ -589,8 +597,8 @@ def build_output_payload(
             is_url=is_url,
             is_youtube_url=is_youtube_url,
         ),
-        "metadata": normalize_metadata(metadata),
-        "transcript": normalize_transcript(transcript),
+        "metadata": normalized_metadata,
+        "transcript": normalized_transcript,
         "visuals": normalized_visuals,
         "visual_sampling": normalized_visual_sampling,
         "audio_features": normalized_audio_features,
